@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <exception>
 #include <string>
