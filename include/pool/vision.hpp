@@ -57,6 +57,15 @@ struct DetectOptions {
     double stripeWhiteMin = 0.42;               // stripe ball white fraction
     double areaMin = 20;                        // px^2, ignore tiny blobs
     double areaLoFactor = 0.30, areaHiFactor = 2.4;  // around median blob area
+    // Dominant-surface (non-green felt) match windows, calibrated on real
+    // 8BP window captures: felt s 0.52..0.87 / v 0.58..0.81 around the
+    // dominant bin, while the navy background (v~0.26) and dark UI chrome
+    // (s~0.18) must stay outside.
+    double feltTolS = 0.20, feltTolV = 0.30;
+    // Manual overrides ("edit anything" workflow, set via tune/overlay ini):
+    double forceBallR = 0;       // px, 0 = auto
+    Rect forceRect{0, 0, 0, 0};  // px rect, w<=0 = auto-detect
+    bool stripLines = true;      // morphological aim-line removal
 };
 
 struct DetectResult {

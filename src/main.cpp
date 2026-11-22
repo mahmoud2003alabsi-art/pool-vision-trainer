@@ -18,6 +18,12 @@
 //       and the minimum power that pots. Writes <image>_sim_annotated.png
 //       and <image>_sim_result.json.
 //
+//   pool-trainer tune <image> [--out DIR] [--table WxH] [--rect x0,y0,x1,y1]
+//       [--ballr N] [--tols S] [--tolv V] [--no-strip] [--save]
+//       Manual calibration on a screenshot: apply overrides, print what
+//       detection finds, optionally --save them into pool-overlay.ini for
+//       the live overlay to consume.
+//
 //   pool-trainer version
 #include "pool/jsonw.hpp"
 #include "pool/physics.hpp"
@@ -52,6 +58,12 @@ struct Args {
     double contactX = 0, contactY = 0;  // cue contact point, ball-radius units
     double dirDeg = -999;     // manual aim direction (image axes, y down)
     int shotIdx = 1;          // 1-based solver shot index for simulate
+    // tune overrides
+    std::string rectOverride;  // "x0,y0,x1,y1" pixels
+    double ballR = 0;          // px, 0 = auto
+    double tolS = -1, tolV = -1;
+    bool noStrip = false;
+    bool saveIni = false;
 };
 
 Args parseArgs(int argc, char** argv) {
@@ -91,8 +103,14 @@ Args parseArgs(int argc, char** argv) {
             a.contactY = std::stod(v.substr(c + 1));
         } else if (s == "--dir") a.dirDeg = std::stod(need(s.c_str()));
         else if (s == "--shot") a.shotIdx = std::stoi(need(s.c_str()));
+        else if (s == "--rect") a.rectOverride = need(s.c_str());
+        else if (s == "--ballr") a.ballR = std::stod(need(s.c_str()));
+        else if (s == "--tols") a.tolS = std::stod(need(s.c_str()));
+        else if (s == "--tolv") a.tolV = std::stod(need(s.c_str()));
+        else if (s == "--no-strip") a.noStrip = true;
+        else if (s == "--save") a.saveIni = true;
         else if (s == "demo" || s == "analyze" || s == "version" ||
-                 s == "simulate") a.cmd = s;
+                 s == "simulate" || s == "tune") a.cmd = s;
         else pos.push_back(s);
     }
     if (!pos.empty()) a.in = pos[0];
@@ -568,6 +586,89 @@ int runSimulate(const Image& img, const TableSpec& tableIn,
 
 }  // namespace
 
+
+// Manual calibration ("edit anything"): apply overrides to the detection,
+// report everything found and optionally persist them into pool-overlay.ini.
+int runTune(const Image& img, const TableSpec& tableIn, const std::string& outDir,
+            const std::string& baseName, const Args& a) {
+    fs::create_directories(outDir);
+    DetectOptions dopt;
+    if (a.tolS >= 0) dopt.feltTolS = a.tolS;
+    if (a.tolV >= 0) dopt.feltTolV = a.tolV;
+    dopt.stripLines = !a.noStrip;
+    if (a.ballR > 1) dopt.forceBallR = a.ballR;
+    if (!a.rectOverride.empty()) {
+        double v[4];
+        int k = 0;
+        size_t pos = 0;
+        while (k < 4) {
+            size_t comma = a.rectOverride.find(',', pos);
+            v[k++] = std::stod(a.rectOverride.substr(
+                pos, comma == std::string::npos ? std::string::npos : comma - pos));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        dopt.forceRect = Rect{v[0], v[1], v[2], v[3]};
+    }
+    DetectResult det;
+    try {
+        det = detectBalls(img, dopt, tableIn);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "detection failed: %s\n", e.what());
+        return 1;
+    }
+    std::vector<Ball> balls;
+    int cueIdx = -1;
+    for (size_t i = 0; i < det.balls.size(); ++i) {
+        const auto& d = det.balls[i];
+        Ball b;
+        b.id = d.number; b.kind = d.kind; b.color = d.color;
+        b.pos = d.logical; b.r = det.table.ballR;
+        if (d.kind == "cue" && cueIdx < 0) cueIdx = static_cast<int>(i);
+        balls.push_back(b);
+    }
+    std::printf("rect px: (%.0f,%.0f)-(%.0f,%.0f)  ballR_px=%.1f  balls=%d\n",
+                det.feltRect.x0, det.feltRect.y0, det.feltRect.x1, det.feltRect.y1,
+                det.ballRPx, static_cast<int>(det.balls.size()));
+    for (const auto& d : det.balls)
+        std::printf("  %-7s %-12s px=(%.0f,%.0f) white=%.2f\n", d.kind.c_str(),
+                    d.color.c_str(), d.px.x, d.px.y, d.whiteRatio);
+    int shotCount = 0;
+    if (cueIdx >= 0 && balls.size() >= 2) {
+        Solver solver(det.table, balls, cueIdx, SolverOptions{a.maxRails, 80.0, 0.98});
+        shotCount = static_cast<int>(solver.allShots().size());
+    }
+    std::printf("shots: %d\n", shotCount);
+
+    // Persist everything the overlay consumes. Rect stored as fractions of
+    // the image size so the live overlay can map it onto its own capture.
+    if (a.saveIni) {
+        double fx0 = det.feltRect.x0 / img.w, fy0 = det.feltRect.y0 / img.h;
+        double fx1 = det.feltRect.x1 / img.w, fy1 = det.feltRect.y1 / img.h;
+        std::string iniPath = (fs::path(a.out) / "pool-overlay.ini").string();
+        FILE* f = std::fopen(iniPath.c_str(), "w");
+        if (!f) {
+            std::fprintf(stderr, "failed to write %s\n", iniPath.c_str());
+            return 1;
+        }
+        std::fprintf(f,
+                     "# pool-overlay.ini - generated by: pool-trainer tune %s --save\n"
+                     "window=8 ball pool\n"
+                     "tableW=%.0f\ntableH=%.0f\nrails=%d\nshots=%d\nfps=12\n"
+                     "guides=1\naimPreview=1\n"
+                     "ballR=%.1f\nfeltTolS=%.2f\nfeltTolV=%.2f\nstripLines=%d\n"
+                     "manualRect=%d\nrectX0=%.4f\nrectY0=%.4f\nrectX1=%.4f\nrectY1=%.4f\n",
+                     baseName.c_str(), a.tableW, a.tableH, a.maxRails, a.top,
+                     a.ballR > 1 ? a.ballR : 0.0, dopt.feltTolS, dopt.feltTolV,
+                     dopt.stripLines ? 1 : 0,
+                     a.rectOverride.empty() ? 0 : 1, fx0, fy0, fx1, fy1);
+        std::fclose(f);
+        std::printf("wrote %s\n", iniPath.c_str());
+        std::printf("copy it next to pool-overlay.exe (or pass --config)\n");
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     Args a = parseArgs(argc, argv);
 
@@ -633,6 +734,27 @@ int main(int argc, char** argv) {
         return runSimulate(img, table, a.out, base, a);
     }
 
+    if (a.cmd == "tune") {
+        if (a.in.empty()) {
+            std::fprintf(stderr, "usage: pool-trainer tune <image> [options]\n");
+            return 2;
+        }
+        Image img;
+        try {
+            img = loadImage(a.in);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            return 1;
+        }
+        TableSpec table = TableSpec::standard();
+        table.w = a.tableW;
+        table.h = a.tableH;
+        table.pockets = TableSpec::standard().pockets;
+        fs::path p(a.in);
+        std::string base = p.stem().string();
+        return runTune(img, table, a.out, base, a);
+    }
+
     std::fprintf(stderr,
                  "usage:\n"
                  "  pool-trainer demo [--out DIR] [--seed N] [--max-rails N]\n"
@@ -641,6 +763,8 @@ int main(int argc, char** argv) {
                  "  pool-trainer simulate <image> [--out DIR] [--table WxH]"
                  " [--power P] [--contact DX,DY] [--dir DEG] [--shot N]"
                  " [--max-rails N]\n"
+                 "  pool-trainer tune <image> [--rect x0,y0,x1,y1] [--ballr N]"
+                 " [--tols S] [--tolv V] [--no-strip] [--save]\n"
                  "  pool-trainer version\n");
     return a.cmd.empty() ? (a.in.empty() ? 0 : 2) : 2;
 }

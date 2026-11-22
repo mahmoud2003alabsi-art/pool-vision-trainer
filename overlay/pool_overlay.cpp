@@ -42,6 +42,14 @@ struct Args {
     int rails = 2;
     int shots = 1;
     int fps = 12;
+    // "edit anything" tunables (pool-overlay.ini + live hotkeys)
+    double ballR = 0;        // px, 0 = auto
+    double feltTolS = 0.20;  // dominant-surface match windows
+    double feltTolV = 0.30;
+    bool stripLines = true;
+    bool aimPreview = true;
+    bool manualRect = false;
+    double rectX0 = 0, rectY0 = 0, rectX1 = 1, rectY1 = 1;  // client fractions
 };
 
 Args g_args;
@@ -57,13 +65,98 @@ void printUsage() {
         "  --rails N        max cushion bounces for bank/kick shots (0-3, default 2)\n"
         "  --shots N        draw the best N shots (1-5, default 1)\n"
         "  --fps N          analysis frames per second (2-30, default 12)\n"
-        "hotkeys: F9 = show/hide guides, F12 = quit\n");
+        "hotkeys: F9 = show/hide guides, F10 = save settings, F12 = quit\n"
+        "         F7/F8 = ball size -/+ (0 = auto), [ / ] = felt tolerance\n"
+         "         A = aim preview, R = manual rect, arrows = move rect,\n"
+         "         1-5 = shots count, D = dump settings\n"
+         "settings load from pool-overlay.ini next to the exe;\n"
+         "pool-trainer tune <screenshot> --save generates it\n");
 }
 
 std::wstring lower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
     return s;
+}
+
+static std::wstring iniPath() {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir(exe);
+    size_t slash = dir.find_last_of(L'\\');
+    if (slash != std::wstring::npos) dir.resize(slash);
+    return dir + L"\\pool-overlay.ini";
+}
+
+// "edit anything" persistence: key=value lines consumed at startup,
+// rewritten by F10 after live hotkey tuning.
+void applyIni(Args& a, const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char buf[4096] = {};
+    DWORD got = 0;
+    ReadFile(f, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(f);
+    auto strVal = [&](const char* key) -> const char* {
+        const char* p = std::strstr(buf, key);
+        if (!p) return nullptr;
+        p += std::strlen(key);
+        return *p == '=' ? p + 1 : nullptr;
+    };
+    auto numVal = [&](const char* key) -> double {
+        const char* p = strVal(key);
+        return p ? std::atof(p) : 0.0;
+    };
+    if (const char* p = strVal("window")) {
+        int wl = MultiByteToWideChar(CP_UTF8, 0, p, -1, nullptr, 0);
+        if (wl > 1) {
+            std::wstring w(wl - 1, 0);
+            MultiByteToWideChar(CP_UTF8, 0, p, -1, w.data(), wl);
+            a.window = w;
+        }
+    }
+    if (strVal("tableW")) a.tw = numVal("tableW");
+    if (strVal("tableH")) a.th = numVal("tableH");
+    if (strVal("rails")) a.rails = static_cast<int>(numVal("rails"));
+    if (strVal("shots")) a.shots = static_cast<int>(numVal("shots"));
+    if (strVal("fps")) a.fps = static_cast<int>(numVal("fps"));
+    if (strVal("guides")) g_visible = numVal("guides") != 0;
+    if (strVal("aimPreview")) a.aimPreview = numVal("aimPreview") != 0;
+    if (strVal("ballR")) a.ballR = numVal("ballR");
+    if (strVal("feltTolS")) a.feltTolS = numVal("feltTolS");
+    if (strVal("feltTolV")) a.feltTolV = numVal("feltTolV");
+    if (strVal("stripLines")) a.stripLines = numVal("stripLines") != 0;
+    if (strVal("manualRect")) a.manualRect = numVal("manualRect") != 0;
+    if (strVal("rectX0")) a.rectX0 = numVal("rectX0");
+    if (strVal("rectY0")) a.rectY0 = numVal("rectY0");
+    if (strVal("rectX1")) a.rectX1 = numVal("rectX1");
+    if (strVal("rectY1")) a.rectY1 = numVal("rectY1");
+}
+
+void saveIni() {
+    std::wstring path = iniPath();
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        std::printf("[!] cannot write ini\n");
+        return;
+    }
+    char buf[1024];
+    int n = std::snprintf(buf, sizeof(buf),
+        "window=8 ball pool\ntableW=%.0f\ntableH=%.0f\nrails=%d\nshots=%d\n"
+        "fps=%d\nguides=%d\naimPreview=%d\nballR=%.1f\nfeltTolS=%.2f\n"
+        "feltTolV=%.2f\nstripLines=%d\nmanualRect=%d\n"
+        "rectX0=%.4f\nrectY0=%.4f\nrectX1=%.4f\nrectY1=%.4f\n",
+        g_args.tw, g_args.th, g_args.rails, g_args.shots, g_args.fps,
+        g_visible ? 1 : 0, g_args.aimPreview ? 1 : 0, g_args.ballR,
+        g_args.feltTolS, g_args.feltTolV, g_args.stripLines ? 1 : 0,
+        g_args.manualRect ? 1 : 0, g_args.rectX0, g_args.rectY0,
+        g_args.rectX1, g_args.rectY1);
+    DWORD wrote = 0;
+    WriteFile(f, buf, static_cast<DWORD>(n > 0 ? n : 0), &wrote, nullptr);
+    CloseHandle(f);
+    std::printf("[i] saved %ls\n", path.c_str());
 }
 
 Args parseArgs() {
@@ -79,9 +172,22 @@ Args parseArgs() {
         else if (s == L"--rails") a.rails = _wtoi(next().c_str());
         else if (s == L"--shots") a.shots = _wtoi(next().c_str());
         else if (s == L"--fps") a.fps = _wtoi(next().c_str());
+        else if (s == L"--ballr") a.ballR = _wtof(next().c_str());
+        else if (s == L"--tols") a.feltTolS = _wtof(next().c_str());
+        else if (s == L"--tolv") a.feltTolV = _wtof(next().c_str());
+        else if (s == L"--no-strip") a.stripLines = false;
+        else if (s == L"--no-aim") a.aimPreview = false;
+        else if (s == L"--manual-rect") a.manualRect = true;
+        else if (s == L"--rect") {
+            std::wstring v = next();
+            swscanf(v.c_str(), L"%lf,%lf,%lf,%lf", &a.rectX0, &a.rectY0,
+                    &a.rectX1, &a.rectY1);
+            a.manualRect = true;
+        }
         else if (s == L"--help" || s == L"-h") { printUsage(); ExitProcess(0); }
     }
     LocalFree(v);
+    applyIni(a, iniPath());
     a.rails = std::min(std::max(a.rails, 0), 3);
     a.shots = std::min(std::max(a.shots, 1), 5);
     a.fps = std::min(std::max(a.fps, 2), 30);
@@ -141,7 +247,7 @@ bool captureClient(HWND hwnd, pool::Image& out) {
         bi.bmiHeader.biCompression = BI_RGB;
         const int stride = ((w * 3 + 3) / 4) * 4;  // 24bpp rows are padded
         std::vector<unsigned char> buf(static_cast<size_t>(stride) * h);
-        if (GetDIBits(mem, bmp, 0, h, buf.data(), &bi, DIB_RGB_COLORS)) {
+        auto convertBits = [&]() {
             out.w = w;
             out.h = h;
             out.px.resize(static_cast<size_t>(w) * h * 3);
@@ -154,8 +260,31 @@ bool captureClient(HWND hwnd, pool::Image& out) {
                     dst[x * 3 + 2] = row[x * 3 + 0];
                 }
             }
+        };
+        if (GetDIBits(mem, bmp, 0, h, buf.data(), &bi, DIB_RGB_COLORS)) {
+            convertBits();
         } else {
             ok = FALSE;
+        }
+        // GPU-protected windows can render PrintWindow as a black frame:
+        // detect it and fall back to a screen blit of the client rect.
+        if (ok) {
+            long sum = 0;
+            int samples = 0;
+            for (size_t i = 0; i < out.px.size(); i += 48) sum += out.px[i];
+            if (samples > 0 && sum / samples < 6) {
+                ShowWindow(g_ov, SW_HIDE);
+                POINT pt{};
+                ClientToScreen(hwnd, &pt);
+                HDC sdc = GetDC(nullptr);
+                ok = BitBlt(mem, 0, 0, w, h, sdc, pt.x, pt.y, SRCCOPY | CAPTUREBLT);
+                ReleaseDC(nullptr, sdc);
+                if (ok) {
+                    GetDIBits(mem, bmp, 0, h, buf.data(), &bi, DIB_RGB_COLORS);
+                    convertBits();
+                }
+                if (g_visible) ShowWindow(g_ov, SW_SHOWNOACTIVATE);
+            }
         }
     }
 
@@ -253,6 +382,25 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
             DeleteObject(ypen);
         }
     }
+    ReleaseDC(g_ov, dc);
+}
+
+std::wstring g_status;  // one-line HUD text, updated by the analysis loop
+
+void drawHud() {
+    if (!g_ov || !g_visible || g_status.empty()) return;
+    HDC dc = GetDC(g_ov);
+    RECT rc;
+    GetClientRect(g_ov, &rc);
+    rc.bottom = rc.top + 22;
+    RECT bg = {0, 0, rc.right, rc.bottom};
+    HBRUSH br = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(dc, &bg, br);
+    DeleteObject(br);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 120));
+    DrawTextW(dc, g_status.c_str(), -1, &rc,
+              DT_SINGLELINE | DT_LEFT | DT_VCENTER);
     ReleaseDC(g_ov, dc);
 }
 
@@ -390,6 +538,49 @@ int main() {
             std::printf("[i] guides %s\n", g_visible ? "shown" : "hidden");
         }
         if (GetAsyncKeyState(VK_F12) & 1) break;
+        // Live tuning hotkeys ("edit anything").
+        if (GetAsyncKeyState(VK_F10) & 1) saveIni();
+        if (GetAsyncKeyState(VK_F7) & 1) {
+            g_args.ballR = g_args.ballR > 3.5 ? g_args.ballR - 0.5 : 0;
+            g_args.manualRect = false;
+            std::printf("[i] ballR=%.1f (0=auto)\n", g_args.ballR);
+        }
+        if (GetAsyncKeyState(VK_F8) & 1) {
+            g_args.ballR += 0.5;
+            std::printf("[i] ballR=%.1f\n", g_args.ballR);
+        }
+        if (GetAsyncKeyState(VK_OEM_4) & 1) {  // '['
+            g_args.feltTolV = std::max(0.05, g_args.feltTolV - 0.02);
+            std::printf("[i] feltTolV=%.2f\n", g_args.feltTolV);
+        }
+        if (GetAsyncKeyState(VK_OEM_6) & 1) {  // ']'
+            g_args.feltTolV = std::min(0.60, g_args.feltTolV + 0.02);
+            std::printf("[i] feltTolV=%.2f\n", g_args.feltTolV);
+        }
+        if (GetAsyncKeyState('A') & 1) {
+            g_args.aimPreview = !g_args.aimPreview;
+            std::printf("[i] aim preview %s\n", g_args.aimPreview ? "ON" : "OFF");
+        }
+        if (GetAsyncKeyState('R') & 1) {
+            g_args.manualRect = !g_args.manualRect;
+            std::printf("[i] manual rect %s\n", g_args.manualRect ? "ON" : "OFF");
+        }
+        if (GetAsyncKeyState(VK_LEFT) & 1) g_args.rectX0 += 0.005;
+        if (GetAsyncKeyState(VK_RIGHT) & 1) g_args.rectX0 -= 0.005;
+        if (GetAsyncKeyState(VK_UP) & 1) g_args.rectY0 += 0.005;
+        if (GetAsyncKeyState(VK_DOWN) & 1) g_args.rectY0 -= 0.005;
+        for (int n = '1'; n <= '5'; ++n)
+            if (GetAsyncKeyState(n) & 1) {
+                g_args.shots = n - '0';
+                std::printf("[i] shots=%d\n", g_args.shots);
+            }
+        if (GetAsyncKeyState('D') & 1) {
+            std::printf("[i] dump: ballR=%.1f tolS=%.2f tolV=%.2f strip=%d "
+                        "manual=%d rect=[%.3f,%.3f,%.3f,%.3f]\n",
+                        g_args.ballR, g_args.feltTolS, g_args.feltTolV,
+                        g_args.stripLines ? 1 : 0, g_args.manualRect ? 1 : 0,
+                        g_args.rectX0, g_args.rectY0, g_args.rectX1, g_args.rectY1);
+        }
 
         if (!game || !IsWindow(game) || IsIconic(game)) game = findGameWindow(needle);
         if (game) {
@@ -404,7 +595,17 @@ int main() {
             bool analyzed = false;
             if (captureClient(game, cap)) {
                 try {
-                    pool::DetectResult det = pool::detectBalls(cap, {}, tbl);
+                    pool::DetectOptions dopt;
+                    dopt.feltTolS = g_args.feltTolS;
+                    dopt.feltTolV = g_args.feltTolV;
+                    dopt.stripLines = g_args.stripLines;
+                    if (g_args.ballR > 1) dopt.forceBallR = g_args.ballR;
+                    if (g_args.manualRect && g_args.rectX1 > g_args.rectX0 &&
+                        g_args.rectY1 > g_args.rectY0)
+                        dopt.forceRect = pool::Rect{
+                            g_args.rectX0 * cap.w, g_args.rectY0 * cap.h,
+                            g_args.rectX1 * cap.w, g_args.rectY1 * cap.h};
+                    pool::DetectResult det = pool::detectBalls(cap, dopt, tbl);
                     std::vector<pool::Ball> balls;
                     int cueIdx = -1;
                     for (size_t i = 0; i < det.balls.size(); ++i) {
@@ -422,7 +623,9 @@ int main() {
                     // its white guideline — predict the CURRENT aim's outcome
                     // with the physics sim. Idle frames show best-shot guides.
                     bool drewSim = false;
-                    if (cueIdx >= 0 && balls.size() >= 2) {
+                    int aimPotted = 0;
+                    bool aimScratch = false;
+                    if (g_args.aimPreview && cueIdx >= 0 && balls.size() >= 2) {
                         std::vector<pool::Vec2> otherPx;
                         for (size_t i = 0; i < det.balls.size(); ++i)
                             if (static_cast<int>(i) != cueIdx)
@@ -444,6 +647,8 @@ int main() {
                                 dirL * (pool::PhysicsParams{}.maxShotSpeed * power),
                                 0, 0);
                             drawSimPreview(det, balls, sim, dirPx);
+                            aimPotted = static_cast<int>(sim.potted.size());
+                            aimScratch = sim.cueScratch;
                             drewSim = true;
                             if (frame % 24 == 0)
                                 std::printf(
@@ -460,6 +665,22 @@ int main() {
                         shots = solver.allShots();
                     }
                     if (!drewSim) drawGuides(det, shots, g_args.shots);
+                    {
+                        wchar_t buf[160];
+                        _snwprintf(buf, 160,
+                                   L"balls=%d shots=%d aim=%s pot=%d%s "
+                                   L"| R=%.1f tolV=%.2f%s",
+                                   static_cast<int>(balls.size()),
+                                   static_cast<int>(shots.size()),
+                                   drewSim ? L"ON" : L"-",
+                                   drewSim ? aimPotted : 0,
+                                   drewSim && aimScratch ? L" SCRATCH!" : L"",
+                                   g_args.ballR > 1 ? g_args.ballR : det.ballRPx,
+                                   g_args.feltTolV,
+                                   g_args.manualRect ? L" [MAN]" : L"");
+                        g_status = buf;
+                    }
+                    drawHud();
                     analyzed = true;
                     if (frame % 24 == 0)
                         std::printf("[ok] balls=%d shots=%d best=%s\n",
@@ -467,6 +688,14 @@ int main() {
                                     shots.empty() ? "-" : shots[0].typeName.c_str());
                 } catch (const std::exception& e) {
                     if (frame % 24 == 0) std::printf("[--] %s\n", e.what());
+                    int wl = MultiByteToWideChar(CP_UTF8, 0, e.what(), -1,
+                                                 nullptr, 0);
+                    if (wl > 1) {
+                        std::wstring w(wl - 1, 0);
+                        MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, w.data(), wl);
+                        g_status = L"[!] " + w;
+                    }
+                    drawHud();
                 }
             }
             if (!analyzed) clearOverlay();
