@@ -137,10 +137,16 @@ int main() {
         Solver solver(t, balls, 0);
         Shot s = solver.solveKick(1, {0});
         expectTrue(s.feasible, "kick 1 rail feasible");
-        expectTrue(s.cuePath.size() == 3, "kick path C -> rail -> T");
+        expectTrue(s.cuePath.size() == 3, "kick path C -> rail -> ghost");
         Vec2 bounce = s.cuePath[1];
         expectNear(bounce.y, 0, 1e-9, "kick bounce on top rail");
         expectNear(bounce.x, 150, 1e-9, "kick bounce x (mirror math)");
+        // Regression: the path must stop at the contact point, 2R short of
+        // the object center — never at the center itself.
+        expectNear(s.cuePath.back().dist({300, 300}), 2 * 12, 1e-6,
+                   "kick ends 2R from object");
+        expectNear(s.ghost.dist(s.cuePath.back()), 0.0, 1e-9,
+                   "kick ghost == path end");
         expectTrue(s.confidence > 0 && s.confidence <= 1, "kick confidence range");
     }
 
@@ -163,7 +169,8 @@ int main() {
     }
 
     // 2-rail kick consistency: bounce points land on the requested rails in
-    // order and the final segment ends at the object ball.
+    // order and the final segment stops at the ghost contact point, 2R short
+    // of the object ball.
     {
         TableSpec t = stdTable();
         std::vector<Ball> balls(2);
@@ -176,7 +183,8 @@ int main() {
             expectTrue(s.cuePath.size() == 4, "kick 2-rail path length");
             expectNear(s.cuePath[1].x, 0, 1e-9, "2-rail bounce1 on left rail");
             expectNear(s.cuePath[2].y, 0, 1e-9, "2-rail bounce2 on top rail");
-            expectNear(s.cuePath.back().x, 700, 1e-9, "2-rail end at object");
+            expectNear(s.cuePath.back().dist({700, 120}), 2 * 12, 1e-6,
+                       "2-rail kick ends 2R from object");
         }
         // Feasibility itself depends on whether bounce points fall within
         // rail extents; the solver must never return a path with a bounce
@@ -215,6 +223,22 @@ int main() {
         for (size_t i = 0; i + 1 < shots.size(); ++i)
             expectTrue(shots[i].confidence >= shots[i + 1].confidence,
                        "shots sorted desc");
+    }
+
+    // max-rails 0: the solver must generate direct shots only — no bank or
+    // kick paths with rail bounces.
+    {
+        TableSpec t = stdTable();
+        std::vector<Ball> balls(3);
+        balls[0].kind = "cue";    balls[0].pos = {380, 120};
+        balls[1].kind = "solid";  balls[1].pos = {520, 180};
+        balls[2].kind = "stripe"; balls[2].pos = {620, 350};
+
+        Solver solver(t, balls, 0, SolverOptions{0, 80.0, 0.98});
+        std::vector<Shot> shots = solver.allShots();
+        expectTrue(!shots.empty(), "max-rails 0 non-empty");
+        for (const auto& s : shots)
+            expectTrue(s.typeName == "direct", "max-rails 0 yields direct only");
     }
 
     // Cut-too-thin rejection: object almost behind the cue's back.

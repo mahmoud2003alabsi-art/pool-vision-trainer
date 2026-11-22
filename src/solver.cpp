@@ -203,10 +203,15 @@ Shot Solver::solveKick(int objIdx, const std::vector<int>& rails) const {
     std::string err;
     if (!unfoldPath(C, imgs, rails, hits, err)) { s.feasible = false; s.note = err; return s; }
 
+    // The cue center stops at the contact point (ghost ball), 2R short of
+    // the object center along the final approach direction — same convention
+    // as direct/bank shots.
+    Vec2 approach = (T - hits.back()).norm();
+    Vec2 ghost = T - approach * (2 * t_.ballR);
     s.cuePath.push_back(C);
     for (auto& h : hits) s.cuePath.push_back(h);
-    s.cuePath.push_back(T);
-    s.ghost = T;  // contact point at the object ball
+    s.cuePath.push_back(ghost);
+    s.ghost = ghost;
 
     for (size_t i = 0; i + 1 < s.cuePath.size(); ++i) {
         if (!pathClear(s.cuePath[i], s.cuePath[i + 1], cueIdx_, objIdx)) {
@@ -227,7 +232,9 @@ Shot Solver::solveKick(int objIdx, const std::vector<int>& rails) const {
 // --------------------------------------------------------------------------
 std::vector<std::vector<int>> railSequences(int maxRails) {
     std::vector<std::vector<int>> out;
-    for (int a = 0; a < 4; ++a) out.push_back({a});
+    if (maxRails >= 1) {
+        for (int a = 0; a < 4; ++a) out.push_back({a});
+    }
     if (maxRails >= 2) {
         for (int a = 0; a < 4; ++a)
             for (int b = 0; b < 4; ++b)

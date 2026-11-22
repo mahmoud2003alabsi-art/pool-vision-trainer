@@ -366,5 +366,5 @@ int main(int argc, char** argv) {
                  "  pool-trainer analyze <image> [--out DIR] [--table WxH]"
                  " [--max-rails N] [--top N]\n"
                  "  pool-trainer version\n");
-    return a.cmd.empty() ? 0 : 2;
+    return a.cmd.empty() ? (a.in.empty() ? 0 : 2) : 2;
 }
