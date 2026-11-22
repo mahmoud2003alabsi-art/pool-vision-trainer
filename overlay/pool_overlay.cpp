@@ -22,8 +22,13 @@
 #include "pool/physics.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
+
+#include "menu_ui.hpp"
 #include <cwctype>
 #include <exception>
 #include <string>
@@ -80,6 +85,8 @@ std::wstring lower(std::wstring s) {
     return s;
 }
 
+static void LOGF(const char* fmt, ...);  // defined below (after capture)
+
 static std::wstring iniPath() {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -110,11 +117,15 @@ void applyIni(Args& a, const std::wstring& path) {
         return p ? std::atof(p) : 0.0;
     };
     if (const char* p = strVal("window")) {
-        int wl = MultiByteToWideChar(CP_UTF8, 0, p, -1, nullptr, 0);
-        if (wl > 1) {
-            std::wstring w(wl - 1, 0);
-            MultiByteToWideChar(CP_UTF8, 0, p, -1, w.data(), wl);
-            a.window = w;
+        if (strcmp(p, "auto") == 0) {
+            a.window.clear();  // auto-detect any pool game
+        } else {
+            int wl = MultiByteToWideChar(CP_UTF8, 0, p, -1, nullptr, 0);
+            if (wl > 1) {
+                std::wstring w(wl - 1, 0);
+                MultiByteToWideChar(CP_UTF8, 0, p, -1, w.data(), wl);
+                a.window = w;
+            }
         }
     }
     if (strVal("tableW")) a.tw = numVal("tableW");
@@ -140,24 +151,34 @@ void saveIni() {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
-        std::printf("[!] cannot write ini\n");
+        LOGF("[!] cannot write ini");
         return;
     }
     char buf[1024];
+    // Fixed window title or "auto" (= detect any pool game).
+    std::string winNarrow = g_args.window.empty() ? "auto" : "";
+    if (winNarrow.empty()) {
+        int wl = WideCharToMultiByte(CP_UTF8, 0, g_args.window.c_str(), -1,
+                                     nullptr, 0, nullptr, nullptr);
+        winNarrow.resize(wl > 1 ? wl - 1 : 0);
+        if (wl > 1)
+            WideCharToMultiByte(CP_UTF8, 0, g_args.window.c_str(), -1,
+                                winNarrow.data(), wl, nullptr, nullptr);
+    }
     int n = std::snprintf(buf, sizeof(buf),
-        "window=8 ball pool\ntableW=%.0f\ntableH=%.0f\nrails=%d\nshots=%d\n"
+        "window=%s\ntableW=%.0f\ntableH=%.0f\nrails=%d\nshots=%d\n"
         "fps=%d\nguides=%d\naimPreview=%d\nballR=%.1f\nfeltTolS=%.2f\n"
         "feltTolV=%.2f\nstripLines=%d\nmanualRect=%d\n"
         "rectX0=%.4f\nrectY0=%.4f\nrectX1=%.4f\nrectY1=%.4f\n",
-        g_args.tw, g_args.th, g_args.rails, g_args.shots, g_args.fps,
-        g_visible ? 1 : 0, g_args.aimPreview ? 1 : 0, g_args.ballR,
-        g_args.feltTolS, g_args.feltTolV, g_args.stripLines ? 1 : 0,
-        g_args.manualRect ? 1 : 0, g_args.rectX0, g_args.rectY0,
-        g_args.rectX1, g_args.rectY1);
+        winNarrow.c_str(), g_args.tw, g_args.th, g_args.rails, g_args.shots,
+        g_args.fps, g_visible ? 1 : 0, g_args.aimPreview ? 1 : 0,
+        g_args.ballR, g_args.feltTolS, g_args.feltTolV,
+        g_args.stripLines ? 1 : 0, g_args.manualRect ? 1 : 0, g_args.rectX0,
+        g_args.rectY0, g_args.rectX1, g_args.rectY1);
     DWORD wrote = 0;
     WriteFile(f, buf, static_cast<DWORD>(n > 0 ? n : 0), &wrote, nullptr);
     CloseHandle(f);
-    std::printf("[i] saved %ls\n", path.c_str());
+    LOGF("[i] settings saved");
 }
 
 Args parseArgs() {
@@ -235,7 +256,7 @@ bool captureClient(HWND hwnd, pool::Image& out) {
         HDC sdc = GetDC(nullptr);
         ok = BitBlt(mem, 0, 0, w, h, sdc, pt.x, pt.y, SRCCOPY | CAPTUREBLT);
         ReleaseDC(nullptr, sdc);
-        if (g_visible) ShowWindow(g_ov, SW_SHOWNOACTIVATE);
+        ShowWindow(g_ov, SW_SHOWNOACTIVATE);
     }
 
     if (ok) {
@@ -284,7 +305,7 @@ bool captureClient(HWND hwnd, pool::Image& out) {
                     GetDIBits(mem, bmp, 0, h, buf.data(), &bi, DIB_RGB_COLORS);
                     convertBits();
                 }
-                if (g_visible) ShowWindow(g_ov, SW_SHOWNOACTIVATE);
+                ShowWindow(g_ov, SW_SHOWNOACTIVATE);
             }
         }
     }
@@ -295,6 +316,487 @@ bool captureClient(HWND hwnd, pool::Image& out) {
     ReleaseDC(hwnd, wdc);
     return ok != FALSE;
 }
+
+// ---- diagnostics: everything goes to pool-overlay.log (no console) ----
+static std::wstring g_logPath;
+
+static void LOGF(const char* fmt, ...) {
+    if (g_logPath.empty()) return;
+    FILE* f = _wfopen(g_logPath.c_str(), L"ab");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// ---- game discovery that works with ANY pool game ----
+// A fixed title (menu/ini) does a substring match; auto mode scores every
+// visible window (pool/billiard/snooker keywords first) and capture-probes
+// candidates one at a time until a plausible table is found.
+static std::vector<std::wstring> g_scanTitles;
+static std::vector<HWND> g_scanHwnds;
+static std::vector<int> g_scanOrder;  // probe order (score-desc)
+static int g_probeCursor = 0;
+static HWND g_game = nullptr;
+static bool g_running = true;
+static bool g_forceScan = false;
+
+static bool excludedWindow(HWND h) {
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
+        !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd") ||
+        !wcscmp(cls, L"ConsoleWindowClass"))
+        return true;
+    return (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0;
+}
+
+static void scanWindows() {
+    struct ScanOut { std::vector<std::wstring> titles; std::vector<HWND> hwnds; };
+    ScanOut out;
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto* o = reinterpret_cast<ScanOut*>(lp);
+        if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+        if (h == g_ov) return TRUE;
+        if (excludedWindow(h)) return TRUE;
+        wchar_t buf[512] = {};
+        if (GetWindowTextW(h, buf, 512) <= 0) return TRUE;
+        RECT rc{};
+        if (!GetClientRect(h, &rc) || rc.right - rc.left < 150 ||
+            rc.bottom - rc.top < 100)
+            return TRUE;
+        o->titles.push_back(buf);
+        o->hwnds.push_back(h);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&out));
+    if (out.titles.size() > 60) {
+        out.titles.resize(60);
+        out.hwnds.resize(60);
+    }
+    g_scanTitles = std::move(out.titles);
+    g_scanHwnds = std::move(out.hwnds);
+    // probe order: pool-keyword titles first
+    std::vector<std::pair<int, int>> scored;  // (index, score)
+    for (size_t i = 0; i < g_scanTitles.size(); ++i) {
+        std::wstring lt = lower(g_scanTitles[i]);
+        int score = 0;
+        if (lt.find(L"pool") != std::wstring::npos ||
+            lt.find(L"billiard") != std::wstring::npos ||
+            lt.find(L"billar") != std::wstring::npos ||
+            lt.find(L"biliar") != std::wstring::npos ||
+            lt.find(L"8 ball") != std::wstring::npos ||
+            lt.find(L"snooker") != std::wstring::npos ||
+            lt.find(L"بليارد") != std::wstring::npos)
+            score = 8;
+        else if (lt.find(L"game") != std::wstring::npos ||
+                 lt.find(L"لعبة") != std::wstring::npos)
+            score = 3;
+        scored.push_back({static_cast<int>(i), score});
+    }
+    std::stable_sort(scored.begin(), scored.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.second > b.second;
+                     });
+    g_scanOrder.clear();
+    for (const auto& e : scored) g_scanOrder.push_back(e.first);
+    g_probeCursor = 0;
+}
+
+// Does a capture of this window contain a plausible pool table?
+bool probeWindow(HWND h) {
+    pool::Image cap;
+    if (!captureClient(h, cap)) return false;
+    if (cap.w < 220 || cap.h < 130) return false;
+    pool::TableSpec t = pool::TableSpec::standard();
+    try {
+        pool::detectBalls(cap, {}, t);  // throws when no plausible table
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static HWND findGameWindowAuto() {
+    for (int tries = 0; tries < 2; ++tries) {
+        if (g_scanHwnds.empty() || g_probeCursor >= (int)g_scanOrder.size()) {
+            g_probeCursor = 0;
+            return nullptr;  // scan exhausted; caller re-scans periodically
+        }
+        int idx = g_scanOrder[g_probeCursor++];
+        if (idx < 0 || idx >= (int)g_scanHwnds.size()) continue;
+        HWND h = g_scanHwnds[idx];
+        if (!IsWindow(h)) continue;
+        if (probeWindow(h)) return h;
+    }
+    return nullptr;
+}
+
+// ---- settings menu (ImGui-style) bound to the live configuration ----
+// Float mirrors bind the pure menu model to the overlay's double/int args;
+// sync/apply run once per frame so slider edits act immediately.
+static mui::Metrics g_m;
+static mui::State g_menu;
+static std::vector<mui::Tab> g_tabs;
+static float mBallR = 0, mTolS = 0.20f, mTolV = 0.30f, mRx0 = 0, mRy0 = 0,
+             mRx1 = 1, mRy1 = 1, mFps = 12, mRails = 2, mShots = 1, mTw = 900,
+             mTh = 530;
+static int mWinIdx = 0, mPreset = 0;
+static int mSaveClicks = 0, mRescanClicks = 0, mExitClicks = 0;
+static int g_lastWinIdx = 0, g_lastPreset = 0;
+static std::string g_gameLabel = "(no game found yet)";
+static const char* kPresets[] = {"8 Ball Pool (900x530)",
+                                 "Generic 2:1 (1000x500)",
+                                 "Compact (800x400)",
+                                 "Snooker-ish (1000x480)"};
+
+static pool::TableSpec g_tbl;
+
+static void rebuildTable() {
+    g_tbl = pool::TableSpec::standard();
+    g_tbl.w = g_args.tw;
+    g_tbl.h = g_args.th;
+    g_tbl.pockets.clear();
+    auto addPk = [&](double x, double y) { g_tbl.pockets.push_back({{x, y}}); };
+    addPk(0, 0);
+    addPk(g_tbl.w / 2, 0);
+    addPk(g_tbl.w, 0);
+    addPk(0, g_tbl.h);
+    addPk(g_tbl.w / 2, g_tbl.h);
+    addPk(g_tbl.w, g_tbl.h);
+}
+
+static std::vector<std::string> g_winNames;
+static std::vector<std::wstring> g_winTitles;
+static std::vector<const char*> g_winOpts;
+
+static void rebuildTabs() {
+    int keep = g_menu.activeTab;
+    g_tabs.clear();
+    mui::Tab aim;
+    aim.name = "AIM";
+    aim.ctrls.push_back({mui::CT_Check, "Show guides", &g_visible});
+    aim.ctrls.push_back(
+        {mui::CT_Check, "Aim preview while aiming", &g_args.aimPreview});
+    aim.ctrls.push_back(
+        {mui::CT_Slider, "Rails", nullptr, &mRails, nullptr, 0.f, 3.f, nullptr,
+         0, "%.0f"});
+    aim.ctrls.push_back(
+        {mui::CT_Slider, "Shots", nullptr, &mShots, nullptr, 1.f, 5.f, nullptr,
+         0, "%.0f"});
+    g_tabs.push_back(aim);
+
+    mui::Tab det;
+    det.name = "DETECT";
+    det.ctrls.push_back({mui::CT_Check, "Strip aim line", &g_args.stripLines});
+    det.ctrls.push_back({mui::CT_Slider, "Ball radius (0 = auto)", nullptr,
+                         &mBallR, nullptr, 0.f, 30.f, nullptr, 0, "%.1f"});
+    det.ctrls.push_back({mui::CT_Slider, "Felt tolerance S", nullptr, &mTolS,
+                         nullptr, 0.05f, 0.6f});
+    det.ctrls.push_back({mui::CT_Slider, "Felt tolerance V", nullptr, &mTolV,
+                         nullptr, 0.05f, 0.6f});
+    g_tabs.push_back(det);
+
+    mui::Tab tab3;
+    tab3.name = "TABLE";
+    tab3.ctrls.push_back({mui::CT_Combo, "Preset", nullptr, nullptr, &mPreset,
+                          0, 0, kPresets, 4});
+    tab3.ctrls.push_back({mui::CT_Check, "Manual table rect", &g_args.manualRect});
+    tab3.ctrls.push_back(
+        {mui::CT_Slider, "Rect X0", nullptr, &mRx0, nullptr, 0.f, 1.f, nullptr,
+         0, "%.3f"});
+    tab3.ctrls.push_back(
+        {mui::CT_Slider, "Rect Y0", nullptr, &mRy0, nullptr, 0.f, 1.f, nullptr,
+         0, "%.3f"});
+    tab3.ctrls.push_back(
+        {mui::CT_Slider, "Rect X1", nullptr, &mRx1, nullptr, 0.f, 1.f, nullptr,
+         0, "%.3f"});
+    tab3.ctrls.push_back(
+        {mui::CT_Slider, "Rect Y1", nullptr, &mRy1, nullptr, 0.f, 1.f, nullptr,
+         0, "%.3f"});
+    tab3.ctrls.push_back({mui::CT_Slider, "Table width", nullptr, &mTw, nullptr,
+                          400.f, 2000.f, nullptr, 0, "%.0f"});
+    tab3.ctrls.push_back({mui::CT_Slider, "Table height", nullptr, &mTh,
+                          nullptr, 200.f, 1200.f, nullptr, 0, "%.0f"});
+    g_tabs.push_back(tab3);
+
+    mui::Tab game;
+    game.name = "GAME";
+    game.ctrls.push_back({mui::CT_Combo, "Window", nullptr, nullptr, &mWinIdx,
+                          0, 0, g_winOpts.data(),
+                          static_cast<int>(g_winOpts.size())});
+    game.ctrls.push_back({mui::CT_Button, "Refresh window list", nullptr,
+                          nullptr, &mRescanClicks});
+    game.ctrls.push_back({mui::CT_Label, g_gameLabel.c_str()});
+    g_tabs.push_back(game);
+
+    mui::Tab misc;
+    misc.name = "MISC";
+    misc.ctrls.push_back(
+        {mui::CT_Slider, "FPS", nullptr, &mFps, nullptr, 4.f, 30.f, nullptr, 0,
+         "%.0f"});
+    misc.ctrls.push_back({mui::CT_Button, "Save settings", nullptr, nullptr,
+                          &mSaveClicks});
+    misc.ctrls.push_back(
+        {mui::CT_Button, "Exit", nullptr, nullptr, &mExitClicks});
+    g_tabs.push_back(misc);
+
+    g_menu.activeTab = keep >= 0 && keep < static_cast<int>(g_tabs.size())
+                           ? keep
+                           : 0;
+}
+
+static void rebuildWindowCombo() {
+    g_winNames.clear();
+    g_winTitles.clear();
+    g_winOpts.clear();
+    g_winNames.push_back("Auto-detect (any game)");
+    g_winOpts.push_back(g_winNames.back().c_str());
+    for (const auto& t : g_scanTitles) {
+        int wl = WideCharToMultiByte(CP_UTF8, 0, t.c_str(), -1, nullptr, 0,
+                                     nullptr, nullptr);
+        std::string n(wl > 1 ? wl - 1 : 0, 0);
+        if (wl > 1)
+            WideCharToMultiByte(CP_UTF8, 0, t.c_str(), -1, n.data(), wl,
+                                nullptr, nullptr);
+        if (n.size() > 46) n = n.substr(0, 46) + "...";
+        g_winTitles.push_back(t);
+        g_winNames.push_back(n);
+        g_winOpts.push_back(g_winNames.back().c_str());
+    }
+    // reflect the current selection
+    if (g_args.window.empty()) {
+        mWinIdx = 0;
+    } else {
+        mWinIdx = 0;
+        for (size_t i = 0; i < g_winTitles.size(); ++i)
+            if (g_winTitles[i] == g_args.window) mWinIdx = static_cast<int>(i) + 1;
+    }
+    g_lastWinIdx = mWinIdx;
+    // current-game label (narrowed)
+    const std::wstring cur = g_args.window.empty() ? std::wstring(L"(auto-detect)")
+                                                   : g_args.window;
+    int wl = WideCharToMultiByte(CP_UTF8, 0, cur.c_str(), -1, nullptr, 0,
+                                 nullptr, nullptr);
+    g_gameLabel = "Current: ";
+    if (wl > 1) {
+        std::string n(static_cast<size_t>(wl) - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, cur.c_str(), -1, n.data(), wl, nullptr,
+                            nullptr);
+        g_gameLabel += n;
+    }
+    rebuildTabs();
+}
+
+static void syncMenuFromArgs() {
+    mBallR = static_cast<float>(g_args.ballR);
+    mTolS = static_cast<float>(g_args.feltTolS);
+    mTolV = static_cast<float>(g_args.feltTolV);
+    mRx0 = static_cast<float>(g_args.rectX0);
+    mRy0 = static_cast<float>(g_args.rectY0);
+    mRx1 = static_cast<float>(g_args.rectX1);
+    mRy1 = static_cast<float>(g_args.rectY1);
+    mFps = static_cast<float>(g_args.fps);
+    mRails = static_cast<float>(g_args.rails);
+    mShots = static_cast<float>(g_args.shots);
+    mTw = static_cast<float>(g_args.tw);
+    mTh = static_cast<float>(g_args.th);
+}
+
+static void applyMenuToArgs() {
+    g_args.ballR = mBallR;
+    g_args.feltTolS = mTolS;
+    g_args.feltTolV = mTolV;
+    g_args.rectX0 = mRx0;
+    g_args.rectY0 = mRy0;
+    g_args.rectX1 = mRx1;
+    g_args.rectY1 = mRy1;
+    g_args.fps = static_cast<int>(mFps);
+    g_args.rails = static_cast<int>(mRails);
+    g_args.shots = static_cast<int>(mShots);
+    if (mPreset != g_lastPreset) {
+        g_lastPreset = mPreset;
+        switch (mPreset) {
+            case 1: mTw = 1000; mTh = 500; break;
+            case 2: mTw = 800; mTh = 400; break;
+            case 3: mTw = 1000; mTh = 480; break;
+            default: mTw = 900; mTh = 530; break;
+        }
+    }
+    if (g_args.tw != mTw || g_args.th != mTh) {
+        g_args.tw = mTw;
+        g_args.th = mTh;
+        rebuildTable();
+    }
+    if (mWinIdx != g_lastWinIdx) {
+        g_lastWinIdx = mWinIdx;
+        if (mWinIdx <= 0 || mWinIdx > static_cast<int>(g_winTitles.size()))
+            g_args.window.clear();  // auto
+        else
+            g_args.window = g_winTitles[static_cast<size_t>(mWinIdx) - 1];
+        g_game = nullptr;  // re-resolve the target window
+        g_forceScan = true;
+    }
+}
+
+// GDI renderer of the pure menu model (dark ImGui-2019 look).
+static COLORREF kPanel = RGB(26, 28, 33), kTitleBar = RGB(45, 91, 142),
+                kTabActive = RGB(55, 90, 127), kTrack = RGB(42, 46, 54),
+                kFill = RGB(62, 110, 170), kBox = RGB(18, 20, 24),
+                kCheckC = RGB(66, 133, 244), kTextC = RGB(240, 240, 245),
+                kDim = RGB(185, 190, 200), kBorder = RGB(70, 75, 85),
+                kPop = RGB(32, 35, 41);
+
+static void fillR(HDC dc, const mui::Rect& r, COLORREF c) {
+    RECT rc = {static_cast<LONG>(r.x), static_cast<LONG>(r.y),
+               static_cast<LONG>(r.x + r.w), static_cast<LONG>(r.y + r.h)};
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, &rc, b);
+    DeleteObject(b);
+}
+
+static void frameR(HDC dc, const mui::Rect& r, COLORREF c) {
+    RECT rc = {static_cast<LONG>(r.x), static_cast<LONG>(r.y),
+               static_cast<LONG>(r.x + r.w - 1), static_cast<LONG>(r.y + r.h - 1)};
+    HBRUSH b = CreateSolidBrush(c);
+    FrameRect(dc, &rc, b);
+    DeleteObject(b);
+}
+
+static void textR(HDC dc, const mui::Rect& r, const wchar_t* t, COLORREF c,
+                  UINT flags = DT_SINGLELINE | DT_LEFT | DT_VCENTER) {
+    RECT rc = {static_cast<LONG>(r.x), static_cast<LONG>(r.y),
+               static_cast<LONG>(r.x + r.w), static_cast<LONG>(r.y + r.h)};
+    SetTextColor(dc, c);
+    DrawTextW(dc, t, -1, &rc, flags);
+}
+
+static wchar_t* widen(const char* s, wchar_t* buf, int cap) {
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, buf, cap);
+    return buf;
+}
+
+static void drawMenu(HDC dc) {
+    if (!g_menu.open || g_tabs.empty()) return;
+    static HFONT fUi = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                   DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    const mui::Tab& t = g_tabs[static_cast<size_t>(g_menu.activeTab)];
+    mui::Rect pr = mui::panelRect(g_m, g_menu, t);
+    fillR(dc, pr, kPanel);
+    frameR(dc, pr, kBorder);
+
+    mui::Rect tr = mui::titleRect(g_m, g_menu);
+    fillR(dc, tr, kTitleBar);
+    textR(dc, {tr.x + 12, tr.y, tr.w - 50, tr.h}, L"Settings",
+          RGB(255, 255, 255));
+    mui::Rect cr = mui::closeRect(g_m, g_menu);
+    fillR(dc, cr, RGB(35, 42, 55));
+    textR(dc, cr, L"X", RGB(255, 255, 255),
+          DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+    wchar_t wname[64];
+    for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i) {
+        mui::Rect r = mui::tabRect(g_m, g_menu, i);
+        bool act = i == g_menu.activeTab;
+        fillR(dc, r, act ? kTabActive : RGB(36, 39, 46));
+        widen(g_tabs[static_cast<size_t>(i)].name, wname, 64);
+        textR(dc, r, wname, act ? RGB(255, 255, 255) : kDim,
+              DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    }
+
+    HGDIOBJ oldFont = SelectObject(dc, fUi);
+    SetBkMode(dc, TRANSPARENT);
+    wchar_t wlabel[160], wtmp[96];
+    for (int i = 0; i < static_cast<int>(t.ctrls.size()); ++i) {
+        const mui::Ctrl& c = t.ctrls[static_cast<size_t>(i)];
+        mui::Rect rr = mui::rowRect(g_m, g_menu, i);
+        widen(c.label, wlabel, 160);
+        if (c.type == mui::CT_Check) {
+            mui::Rect box = {rr.x + 2, rr.y + (rr.h - 16) / 2, 16, 16};
+            fillR(dc, box, kBox);
+            frameR(dc, box, kBorder);
+            if (c.bval && *c.bval) {
+                HPEN pen = CreatePen(PS_SOLID, 2, kCheckC);
+                HGDIOBJ op = SelectObject(dc, pen);
+                MoveToEx(dc, static_cast<int>(box.x) + 3,
+                         static_cast<int>(box.y) + 8, nullptr);
+                LineTo(dc, static_cast<int>(box.x) + 6,
+                       static_cast<int>(box.y) + 12);
+                LineTo(dc, static_cast<int>(box.x) + 13,
+                       static_cast<int>(box.y) + 4);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+            }
+            textR(dc, {rr.x + 28, rr.y, rr.w - 30, rr.h}, wlabel, kTextC);
+        } else if (c.type == mui::CT_Slider) {
+            mui::Rect trk = mui::trackRect(g_m, g_menu, i);
+            fillR(dc, trk, kTrack);
+            float frac =
+                c.fval ? mui::clampf((*c.fval - c.fmin) / (c.fmax - c.fmin),
+                                     0.f, 1.f)
+                       : 0.f;
+            fillR(dc, {trk.x, trk.y, trk.w * frac, trk.h}, kFill);
+            char vb[32] = {};
+            if (c.fval) std::snprintf(vb, 32, c.fmt, *c.fval);
+            textR(dc, trk, widen(vb, wtmp, 96), RGB(255, 255, 255),
+                  DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            textR(dc, {trk.x + trk.w + 10, rr.y, rr.w - trk.w - 12, rr.h},
+                  wlabel, kDim);
+        } else if (c.type == mui::CT_Combo) {
+            mui::Rect trk = mui::trackRect(g_m, g_menu, i);
+            fillR(dc, trk, kTrack);
+            int idx = c.ival ? *c.ival : 0;
+            if (idx < 0 || idx >= c.nopt) idx = 0;
+            const char* curTxt = c.nopt > 0 ? c.options[idx] : "";
+            textR(dc, {trk.x + 8, trk.y, trk.w - 26, trk.h},
+                  widen(curTxt, wtmp, 96), kTextC);
+            POINT tri[3] = {
+                {static_cast<LONG>(trk.x + trk.w - 15),
+                 static_cast<LONG>(trk.y + trk.h / 2 - 3)},
+                {static_cast<LONG>(trk.x + trk.w - 6),
+                 static_cast<LONG>(trk.y + trk.h / 2 - 3)},
+                {static_cast<LONG>(trk.x + trk.w - 10.5f),
+                 static_cast<LONG>(trk.y + trk.h / 2 + 4)}};
+            HBRUSH b = CreateSolidBrush(RGB(215, 220, 230));
+            HPEN pn = CreatePen(PS_SOLID, 1, RGB(215, 220, 230));
+            HGDIOBJ ob = SelectObject(dc, b);
+            HGDIOBJ opn = SelectObject(dc, pn);
+            Polygon(dc, tri, 3);
+            SelectObject(dc, ob);
+            SelectObject(dc, opn);
+            DeleteObject(b);
+            DeleteObject(pn);
+            textR(dc, {trk.x + trk.w + 10, rr.y, rr.w - trk.w - 12, rr.h},
+                  wlabel, kDim);
+            if (g_menu.comboTab == g_menu.activeTab && g_menu.comboCtrl == i) {
+                mui::Rect pop = mui::popRect(g_m, g_menu, i, c.nopt);
+                fillR(dc, pop, kPop);
+                frameR(dc, pop, kBorder);
+                for (int o = 0; o < c.nopt; ++o) {
+                    mui::Rect orow = {pop.x, pop.y + o * g_m.rowH, pop.w,
+                                      g_m.rowH};
+                    textR(dc, {orow.x + 10, orow.y, orow.w - 10, orow.h},
+                          widen(c.options[o], wtmp, 96),
+                          o == idx ? RGB(120, 180, 255) : kTextC);
+                }
+            }
+        } else if (c.type == mui::CT_Button) {
+            mui::Rect br = {rr.x + 2, rr.y + 3, rr.w * 0.72f, rr.h - 6};
+            fillR(dc, br, kTabActive);
+            textR(dc, br, wlabel, RGB(255, 255, 255),
+                  DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        } else {
+            textR(dc, {rr.x + 4, rr.y, rr.w, rr.h}, wlabel, kDim);
+        }
+    }
+    SelectObject(dc, oldFont);
+}
+
+void fillKey(HDC dc, const RECT& rc) {
 
 void fillKey(HDC dc, const RECT& rc) {
     HBRUSH bg = CreateSolidBrush(kKey);
@@ -484,6 +986,7 @@ void drawSimPreview(const pool::DetectResult& det, const std::vector<pool::Ball>
 
 int main() {
     SetProcessDPIAware();  // physical pixels everywhere (DPI-safe capture)
+    g_logPath = iniPath();
     g_args = parseArgs();
     if (!g_args.window.empty() && g_args.window.size() > 200) g_args.window.resize(200);
 
@@ -494,38 +997,38 @@ int main() {
     wc.hbrBackground = CreateSolidBrush(kKey);
     RegisterClassW(&wc);
 
+    // No WS_EX_TRANSPARENT: the settings menu needs clicks. Click-through
+    // elsewhere is restored dynamically every frame (see loop) so the game
+    // keeps receiving input unless the cursor is over the panel.
     g_ov = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
-            WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         wc.lpszClassName, L"", WS_POPUP, 0, 0, 100, 100, nullptr, nullptr,
         wc.hInstance, nullptr);
     if (!g_ov) {
-        std::fprintf(stderr, "fatal: cannot create overlay window\n");
+        MessageBoxW(nullptr, L"Cannot create the overlay window.",
+                    L"pool-overlay", MB_ICONERROR);
         return 1;
     }
     SetLayeredWindowAttributes(g_ov, kKey, 0, LWA_COLORKEY);
     ShowWindow(g_ov, SW_SHOWNOACTIVATE);
 
-    // Logical table for 8 Ball Pool: pockets must follow the custom size.
-    pool::TableSpec tbl = pool::TableSpec::standard();
-    tbl.w = g_args.tw;
-    tbl.h = g_args.th;
-    tbl.pockets.clear();
-    auto addPk = [&](double x, double y) { tbl.pockets.push_back({{x, y}}); };
-    addPk(0, 0); addPk(tbl.w / 2, 0); addPk(tbl.w, 0);
-    addPk(0, tbl.h); addPk(tbl.w / 2, tbl.h); addPk(tbl.w, tbl.h);
+    // Logical table: pockets follow the (menu-adjustable) custom size.
+    rebuildTable();
+    rebuildWindowCombo();
 
-    const std::wstring needle = lower(g_args.window);
-    std::string needleNarrow;
-    for (wchar_t c : needle) needleNarrow.push_back(static_cast<char>(c));
+    {
+        char wbuf[512] = {};
+        WideCharToMultiByte(CP_UTF8, 0,
+                            g_args.window.empty() ? L"(auto)" : g_args.window.c_str(),
+                            -1, wbuf, 512, nullptr, nullptr);
+        LOGF("pool-overlay started. window=\"%s\" table=%.0fx%.0f rails=%d "
+             "shots=%d fps=%d",
+             wbuf, g_args.tw, g_args.th, g_args.rails, g_args.shots,
+             g_args.fps);
+    }
 
-    std::printf("pool-overlay started. window=\"%s\" table=%.0fx%.0f rails=%d shots=%d fps=%d\n",
-                needleNarrow.c_str(), g_args.tw, g_args.th, g_args.rails,
-                g_args.shots, g_args.fps);
-    std::printf("hotkeys: F9 = show/hide guides, F12 = quit\n");
-
-    HWND game = nullptr;
     int frame = 0;
+    bool prevDown = false;
     for (;;) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -533,12 +1036,59 @@ int main() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if ((GetAsyncKeyState(VK_F9) & 1) && g_ov) {
-            g_visible = !g_visible;
-            ShowWindow(g_ov, g_visible ? SW_SHOWNOACTIVATE : SW_HIDE);
-            std::printf("[i] guides %s\n", g_visible ? "shown" : "hidden");
+        // ---- settings menu, fully mouse-driven (no hotkeys) ----
+        if (g_forceScan || frame % 60 == 0) {
+            g_forceScan = false;
+            scanWindows();
+            rebuildWindowCombo();
         }
-        if (GetAsyncKeyState(VK_F12) & 1) break;
+        {
+            bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            POINT mp{};
+            GetCursorPos(&mp);
+            if (g_ov) ScreenToClient(g_ov, &mp);
+            float mx = static_cast<float>(mp.x), my = static_cast<float>(mp.y);
+            // Click-through everywhere except when the cursor hovers the
+            // panel (sticky while dragging): the game keeps its input.
+            bool sticky = g_menu.draggingPanel || g_menu.dragSlider;
+            bool overPanel = false;
+            if (g_menu.open && !g_tabs.empty()) {
+                mui::Rect pr = mui::panelRect(
+                    g_m, g_menu, g_tabs[static_cast<size_t>(g_menu.activeTab)]);
+                overPanel = pr.contains(mx - 4, my - 4) ||
+                            pr.contains(mx + 4, my + 4);
+            }
+            LONG ex = GetWindowLongW(g_ov, GWL_EXSTYLE);
+            LONG want = (overPanel || sticky)
+                            ? (ex & ~WS_EX_TRANSPARENT)
+                            : (ex | WS_EX_TRANSPARENT);
+            if (want != ex) SetWindowLongW(g_ov, GWL_EXSTYLE, want);
+            if (down && !prevDown) {
+                mui::HitResult hr = mui::hitTest(g_m, g_menu, g_tabs, mx, my);
+                if (mui::press(g_m, g_menu, g_tabs, mx, my) &&
+                    hr.hit == mui::H_Ctrl && hr.ctrl >= 0 &&
+                    hr.ctrl < static_cast<int>(
+                                  g_tabs[static_cast<size_t>(g_menu.activeTab)]
+                                      .ctrls.size())) {
+                    const mui::Ctrl& c =
+                        g_tabs[static_cast<size_t>(g_menu.activeTab)]
+                            .ctrls[static_cast<size_t>(hr.ctrl)];
+                    if (c.type == mui::CT_Button) {
+                        if (c.ival == &mSaveClicks) saveIni();
+                        else if (c.ival == &mRescanClicks) g_forceScan = true;
+                        else if (c.ival == &mExitClicks) g_running = false;
+                    }
+                }
+            } else if (down && prevDown) {
+                mui::drag(g_m, g_menu, g_tabs, mx, my);
+            } else {
+                mui::release(g_menu);
+            }
+            prevDown = down;
+            syncMenuFromArgs();
+            applyMenuToArgs();
+        }
+        if (!g_running) break;
         // Live tuning hotkeys ("edit anything").
         if (GetAsyncKeyState(VK_F10) & 1) saveIni();
         if (GetAsyncKeyState(VK_F7) & 1) {
@@ -583,7 +1133,15 @@ int main() {
                         g_args.rectX0, g_args.rectY0, g_args.rectX1, g_args.rectY1);
         }
 
-        if (!game || !IsWindow(game) || IsIconic(game)) game = findGameWindow(needle);
+        if (!g_game || !IsWindow(g_game) || IsIconic(g_game)) {
+            g_game = nullptr;
+            if (!g_args.window.empty()) {
+                g_game = findGameWindow(lower(g_args.window));
+            } else if (frame % 2 == 0) {
+                g_game = findGameWindowAuto();  // one capture probe per tick
+            }
+        }
+        HWND game = g_game;
         if (game) {
             RECT rc;
             GetClientRect(game, &rc);
@@ -606,7 +1164,7 @@ int main() {
                         dopt.forceRect = pool::Rect{
                             g_args.rectX0 * cap.w, g_args.rectY0 * cap.h,
                             g_args.rectX1 * cap.w, g_args.rectY1 * cap.h};
-                    pool::DetectResult det = pool::detectBalls(cap, dopt, tbl);
+                    pool::DetectResult det = pool::detectBalls(cap, dopt, g_tbl);
                     std::vector<pool::Ball> balls;
                     int cueIdx = -1;
                     for (size_t i = 0; i < det.balls.size(); ++i) {
@@ -652,11 +1210,12 @@ int main() {
                             aimScratch = sim.cueScratch;
                             drewSim = true;
                             if (frame % 24 == 0)
-                                std::printf(
-                                    "[aim] deg=%.0f power=%.2f potted=%d scratch=%d\n",
-                                    std::atan2(dirL.y, dirL.x) * 180.0 / 3.14159265358979323846,
-                                    power, static_cast<int>(sim.potted.size()),
-                                    sim.cueScratch ? 1 : 0);
+                                LOGF("[aim] deg=%.0f power=%.2f potted=%d "
+                                     "scratch=%d",
+                                     std::atan2(dirL.y, dirL.x) * 180.0 /
+                                         3.14159265358979323846,
+                                     power, static_cast<int>(sim.potted.size()),
+                                     sim.cueScratch ? 1 : 0);
                         }
                     }
                     std::vector<pool::Shot> shots;
@@ -665,7 +1224,8 @@ int main() {
                                             pool::SolverOptions{g_args.rails, 80.0, 0.98});
                         shots = solver.allShots();
                     }
-                    if (!drewSim) drawGuides(det, shots, g_args.shots);
+                    if (!drewSim && g_visible)
+                        drawGuides(det, shots, g_args.shots);
                     {
                         wchar_t buf[160];
                         _snwprintf(buf, 160,
@@ -681,14 +1241,15 @@ int main() {
                                    g_args.manualRect ? L" [MAN]" : L"");
                         g_status = buf;
                     }
-                    drawHud();
+                    if (!g_menu.open) drawHud();
                     analyzed = true;
                     if (frame % 24 == 0)
-                        std::printf("[ok] balls=%d shots=%d best=%s\n",
-                                    static_cast<int>(balls.size()), shots.size(),
-                                    shots.empty() ? "-" : shots[0].typeName.c_str());
+                        LOGF("[ok] balls=%d shots=%d best=%s",
+                             static_cast<int>(balls.size()),
+                             static_cast<int>(shots.size()),
+                             shots.empty() ? "-" : shots[0].typeName.c_str());
                 } catch (const std::exception& e) {
-                    if (frame % 24 == 0) std::printf("[--] %s\n", e.what());
+                    if (frame % 24 == 0) LOGF("[--] %s", e.what());
                     int wl = MultiByteToWideChar(CP_UTF8, 0, e.what(), -1,
                                                  nullptr, 0);
                     if (wl > 1) {
@@ -696,19 +1257,31 @@ int main() {
                         MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, w.data(), wl);
                         g_status = L"[!] " + w;
                     }
-                    drawHud();
+                    if (!g_menu.open) drawHud();
                 }
             }
             if (!analyzed) clearOverlay();
         } else {
             clearOverlay();
-            if (frame % 60 == 0)
-                std::printf("[--] game window not found (looking for \"%s\")\n",
-                            needleNarrow.c_str());
+            if (frame % 60 == 0) {
+                char wbuf[512] = {};
+                WideCharToMultiByte(
+                    CP_UTF8, 0,
+                    g_args.window.empty() ? L"(auto-detect any pool game)"
+                                          : g_args.window.c_str(),
+                    -1, wbuf, 512, nullptr, nullptr);
+                LOGF("[--] game window not found (looking for \"%s\")", wbuf);
+            }
+        }
+        // menu last so it draws above the guides
+        {
+            HDC dc = GetDC(g_ov);
+            drawMenu(dc);
+            ReleaseDC(g_ov, dc);
         }
         ++frame;
         Sleep(1000 / g_args.fps);
     }
-    std::printf("bye\n");
+    LOGF("bye");
     return 0;
 }

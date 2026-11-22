@@ -42,7 +42,7 @@ target_link_libraries(pool_tests_physics PRIVATE poolcore)
 
 # Windows-only live aim overlay (Win32 + GDI; reuses poolvision).
 if(WIN32)
-  add_executable(pool-overlay overlay/pool_overlay.cpp)
+  add_executable(pool-overlay WIN32 overlay/pool_overlay.cpp)
   target_include_directories(pool-overlay PRIVATE include)
   target_link_libraries(pool-overlay PRIVATE poolvision user32 gdi32 shell32)
   target_compile_definitions(pool-overlay PRIVATE
@@ -67,3 +67,7 @@ endif()
 enable_testing()
 add_test(NAME solver_tests COMMAND pool_tests)
 add_test(NAME physics_tests COMMAND pool_tests_physics)
+
+add_executable(pool_tests_menu tests/test_menu.cpp)
+target_include_directories(pool_tests_menu PRIVATE overlay)
+add_test(NAME menu_tests COMMAND pool_tests_menu)
