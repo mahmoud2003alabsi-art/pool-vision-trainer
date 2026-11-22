@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j 2
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Demo pipeline (generate -> detect -> solve -> annotate)
+        run: ./build/pool-trainer demo --out artifacts
+
+      - name: Round-trip (analyze the generated table image)
+        run: ./build/pool-trainer analyze artifacts/table.png --out artifacts/roundtrip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-results
+          path: artifacts

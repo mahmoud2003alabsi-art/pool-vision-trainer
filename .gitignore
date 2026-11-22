@@ -1,0 +1,7 @@
+build/
+artifacts/
+demo_output/
+*.o
+*.png
+!docs/*.png
+core
