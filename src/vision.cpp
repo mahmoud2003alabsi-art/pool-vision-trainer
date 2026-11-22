@@ -320,6 +320,57 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         }
     }
 
+    // 3b. Strip thin white structures: the in-game aim guideline crosses the
+    // table, physically merges with the white cue ball and shreds the felt
+    // into pseudo-blobs. Morphological opening (two erode + two dilate 3x3
+    // passes) keeps discs (>= ~5px across) and removes lines up to ~4px wide.
+    {
+        std::vector<uint8_t> white(n, 0);
+        for (int y = static_cast<int>(field.y0); y < static_cast<int>(field.y1); ++y) {
+            for (int x = static_cast<int>(field.x0); x < static_cast<int>(field.x1); ++x) {
+                size_t i = static_cast<size_t>(y) * w + x;
+                if (!ballish[i]) continue;
+                Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
+                if (c.s < 0.25 && c.v > 0.70) white[i] = 1;
+            }
+        }
+        std::vector<uint8_t> cur = white, tmp(n, 0), opened(n, 0);
+        auto allNeighbors = [&](const std::vector<uint8_t>& m, int x, int y) {
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = x + dx, ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) return false;
+                    if (!m[static_cast<size_t>(ny) * w + nx]) return false;
+                }
+            return true;
+        };
+        auto anyNeighbor = [&](const std::vector<uint8_t>& m, int x, int y) {
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = x + dx, ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                    if (m[static_cast<size_t>(ny) * w + nx]) return true;
+                }
+            return false;
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    tmp[static_cast<size_t>(y) * w + x] =
+                        allNeighbors(cur, x, y) ? 1 : 0;
+            cur.swap(tmp);
+        }
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    opened[static_cast<size_t>(y) * w + x] =
+                        anyNeighbor(cur, x, y) ? 1 : 0;
+            cur.swap(opened);
+        }
+        for (size_t i = 0; i < n; ++i)
+            if (white[i] && !cur[i]) ballish[i] = 0;
+    }
+
     // 4. Blobs.
     std::vector<Blob> blobs = findBlobs(ballish, w, h);
 
@@ -409,6 +460,16 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         if (b.area < opt.areaMin) continue;
         if (b.area < refArea * opt.areaLoFactor || b.area > refArea * opt.areaHiFactor)
             continue;
+        // Text, name plates and elongated UI are not balls (all paths; photo
+        // shadows attached under balls stay within these bounds). Game
+        // screenshots additionally drop hollow rings/icons by disc fill.
+        double bw = std::max(1.0, b.bbox.w()), bh = std::max(1.0, b.bbox.h());
+        double aspect = bw / bh;
+        if (aspect < 0.45 || aspect > 2.25) continue;
+        if (usedFallback) {
+            double extent = static_cast<double>(b.area) / (bw * bh);
+            if (extent < 0.35) continue;
+        }
         bool nearPocket = false;
         for (const auto& a : anchors)
             if (std::hypot(b.cx - a.x, b.cy - a.y) < pocketExcl) { nearPocket = true; break; }
@@ -501,6 +562,51 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     }
 
     return res;
+}
+
+bool estimateAimDirPx(const Image& img, Vec2 cuePx, double ballRPx,
+                      const std::vector<Vec2>& otherBallPx, Vec2& dirPx) {
+    const int w = img.w, h = img.h;
+    const double r0 = std::max(2.0, ballRPx * 1.25);
+    const double r1 = std::max(r0 + 6.0, ballRPx * 9.0);
+    constexpr double kPi = 3.14159265358979323846;
+    auto isWhiteish = [&](double x, double y) {
+        int xi = static_cast<int>(x), yi = static_cast<int>(y);
+        if (xi < 0 || yi < 0 || xi >= w || yi >= h) return false;
+        size_t i = static_cast<size_t>(yi) * w + xi;
+        Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
+        return c.s < 0.30 && c.v > 0.65;
+    };
+    auto inOtherBall = [&](double x, double y) {
+        for (const auto& p : otherBallPx)
+            if (std::hypot(x - p.x, y - p.y) < ballRPx * 0.95) return true;
+        return false;
+    };
+    auto rayScore = [&](double angDeg) {
+        double a = angDeg * kPi / 180.0;
+        double dx = std::cos(a), dy = std::sin(a);
+        int cnt = 0;
+        for (double r = r0; r <= r1; r += 1.5) {
+            double x = cuePx.x + dx * r, y = cuePx.y + dy * r;
+            if (inOtherBall(x, y)) break;
+            if (isWhiteish(x, y)) ++cnt;
+        }
+        return cnt;
+    };
+    int bestA = -1, bestCnt = 0;
+    for (int a = 0; a < 360; a += 3) {
+        int c = rayScore(static_cast<double>(a));
+        if (c > bestCnt) { bestCnt = c; bestA = a; }
+    }
+    if (bestA < 0 || bestCnt < 5) return false;
+    int fine = bestA;
+    for (int a = bestA - 3; a <= bestA + 3; ++a) {
+        int c = rayScore(static_cast<double>((a + 360) % 360));
+        if (c > bestCnt) { bestCnt = c; fine = (a + 360) % 360; }
+    }
+    double a = fine * kPi / 180.0;
+    dirPx = Vec2{std::cos(a), std::sin(a)};
+    return true;
 }
 
 }  // namespace pool

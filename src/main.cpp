@@ -9,8 +9,18 @@
 //       Detect balls on any top-down table image, solve shots, write
 //       <image>_annotated.png / <image>_result.json.
 //
+//   pool-trainer simulate <image> [--out DIR] [--table WxH] [--power P]
+//       [--contact DX,DY] [--dir DEG] [--shot N] [--max-rails N]
+//       Detect balls, pick an aim (in-game guideline when visible, else the
+//       best solved shot), run the full physics simulation with the given
+//       power and cue contact point, and report the complete outcome:
+//       every ball's path and rest position, potted balls, scratch warning
+//       and the minimum power that pots. Writes <image>_sim_annotated.png
+//       and <image>_sim_result.json.
+//
 //   pool-trainer version
 #include "pool/jsonw.hpp"
+#include "pool/physics.hpp"
 #include "pool/render.hpp"
 #include "pool/solver.hpp"
 #include "pool/synth.hpp"
@@ -38,6 +48,10 @@ struct Args {
     double tableW = 900, tableH = 450;
     int maxRails = 2;
     int top = 3;
+    double power = -1.0;      // <0 = auto (minimum that pots)
+    double contactX = 0, contactY = 0;  // cue contact point, ball-radius units
+    double dirDeg = -999;     // manual aim direction (image axes, y down)
+    int shotIdx = 1;          // 1-based solver shot index for simulate
 };
 
 Args parseArgs(int argc, char** argv) {
@@ -65,7 +79,20 @@ Args parseArgs(int argc, char** argv) {
             a.tableH = std::stod(v.substr(x + 1));
         } else if (s == "--max-rails") a.maxRails = std::stoi(need(s.c_str()));
         else if (s == "--top") a.top = std::stoi(need(s.c_str()));
-        else if (s == "demo" || s == "analyze" || s == "version") a.cmd = s;
+        else if (s == "--power") a.power = std::stod(need(s.c_str()));
+        else if (s == "--contact") {
+            std::string v = need(s.c_str());
+            size_t c = v.find(',');
+            if (c == std::string::npos) {
+                std::fprintf(stderr, "--contact expects DX,DY in [-1,1] (e.g. 0,-0.6)\n");
+                std::exit(2);
+            }
+            a.contactX = std::stod(v.substr(0, c));
+            a.contactY = std::stod(v.substr(c + 1));
+        } else if (s == "--dir") a.dirDeg = std::stod(need(s.c_str()));
+        else if (s == "--shot") a.shotIdx = std::stoi(need(s.c_str()));
+        else if (s == "demo" || s == "analyze" || s == "version" ||
+                 s == "simulate") a.cmd = s;
         else pos.push_back(s);
     }
     if (!pos.empty()) a.in = pos[0];
@@ -315,6 +342,230 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     return 0;
 }
 
+// Full-shot simulation: detect, aim (in-game guideline / solver shot /
+// manual), simulate with power + cue contact point, report and draw
+// everything that will happen.
+int runSimulate(const Image& img, const TableSpec& tableIn,
+                const std::string& outDir, const std::string& baseName,
+                const Args& a) {
+    fs::create_directories(outDir);
+    DetectOptions dopt;
+    DetectResult det;
+    try {
+        det = detectBalls(img, dopt, tableIn);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "detection failed: %s\n", e.what());
+        return 1;
+    }
+    const TableSpec tbl = det.table;
+
+    std::vector<Ball> balls;
+    int cueIdx = -1;
+    std::vector<Vec2> otherPx;
+    for (size_t i = 0; i < det.balls.size(); ++i) {
+        const auto& d = det.balls[i];
+        Ball b;
+        b.id = d.number;
+        b.kind = d.kind;
+        b.color = d.color;
+        b.pos = d.logical;
+        b.r = tbl.ballR;
+        if (d.kind == "cue" && cueIdx < 0) cueIdx = static_cast<int>(i);
+        balls.push_back(b);
+    }
+    for (size_t i = 0; i < det.balls.size(); ++i)
+        if (static_cast<int>(i) != cueIdx) otherPx.push_back(det.balls[i].px);
+    if (cueIdx < 0) {
+        std::fprintf(stderr, "no cue ball detected - cannot simulate\n");
+        return 1;
+    }
+
+    // Pixel <-> logical mapping (identical to the detection shrink).
+    Rect f = det.feltRect;
+    f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
+    auto toPx = [&](Vec2 l) {
+        return Vec2{f.x0 + l.x / tbl.w * f.w(), f.y0 + l.y / tbl.h * f.h()};
+    };
+    auto toLogicalDir = [&](Vec2 pxDir) {
+        Vec2 d{pxDir.x * tbl.w / f.w(), pxDir.y * tbl.h / f.h()};
+        return d.len() > 1e-12 ? d.norm() : Vec2{1, 0};
+    };
+
+    // Choose the aim direction.
+    Vec2 dirL{};
+    std::string aimSource;
+    int targetId = -1;
+    bool haveDir = false;
+    if (a.dirDeg > -900) {
+        double rad = a.dirDeg * 3.14159265358979323846 / 180.0;
+        dirL = toLogicalDir(Vec2{std::cos(rad), std::sin(rad)});
+        aimSource = "manual";
+        haveDir = true;
+    } else if (estimateAimDirPx(img, det.balls[cueIdx].px, det.ballRPx, otherPx,
+                                dirL)) {  // dirL reused as px buffer here
+        dirL = toLogicalDir(dirL);
+        aimSource = "in-game guideline";
+        haveDir = true;
+    }
+    if (!haveDir) {
+        Solver solver(tbl, balls, cueIdx, SolverOptions{a.maxRails, 80.0, 0.98});
+        std::vector<Shot> shots = solver.allShots();
+        if (shots.empty()) {
+            std::fprintf(stderr, "no aim line visible and no feasible shot found\n");
+            return 1;
+        }
+        size_t idx = static_cast<size_t>(std::max(1, a.shotIdx) - 1);
+        if (idx >= shots.size()) idx = 0;
+        const Shot& s = shots[idx];
+        dirL = (s.ghost - balls[cueIdx].pos).norm();
+        targetId = s.objectIdx >= 0 ? balls[s.objectIdx].id : -1;
+        aimSource = "solver shot #" + std::to_string(a.shotIdx);
+    }
+
+    double spinF = clampd(a.contactY, -1.0, 1.0);  // +Y follow, -Y draw
+    double spinS = clampd(a.contactX, -1.0, 1.0);  // X side english
+
+    // Power: user value or the minimum that pots.
+    double power = a.power;
+    bool autoPower = power < 0;
+    if (autoPower) {
+        power = minPotPower(tbl, balls, dirL, spinF, spinS, targetId);
+        if (power < 0) {
+            std::printf("no pot possible along this aim even at 100%% power "
+                        "- showing the full-power outcome anyway\n");
+            power = 1.0;
+        }
+    }
+    power = clampd(power, 0.05, 1.0);
+
+    Vec2 cueVel = dirL * (PhysicsParams{}.maxShotSpeed * power);
+    SimResult sim = simulate(tbl, balls, cueVel, spinF, spinS);
+
+    // ----- console report ---------------------------------------------------
+    constexpr double kPi = 3.14159265358979323846;
+    double aimDeg = std::atan2(dirL.y, dirL.x) * 180.0 / kPi;
+    std::string contactLbl =
+        spinF > 0.25 ? "follow" : (spinF < -0.25 ? "draw" : "stun");
+    if (spinS > 0.25) contactLbl += " + right english";
+    else if (spinS < -0.25) contactLbl += " + left english";
+    std::printf("\n===== SIMULATION =====\n");
+    std::printf("aim: %.1f deg (%s) | power: %.2f%s | contact: (%.1f,%.1f) %s\n",
+                aimDeg, aimSource.c_str(), power, autoPower ? " (auto-min)" : "",
+                spinS, spinF, contactLbl.c_str());
+    if (sim.firstContact >= 0)
+        std::printf("first contact: ball %d\n", sim.firstContact);
+    else
+        std::printf("first contact: none - the aim misses every ball\n");
+    if (sim.potted.empty()) {
+        std::printf("potted: none\n");
+    } else {
+        std::printf("potted:");
+        for (int id : sim.potted) {
+            std::printf(" %d", id);
+            for (const auto& e : sim.events)
+                if (e.kind == "pot" && e.ball == id)
+                    std::printf(" (pocket %d)", e.other + 1);
+        }
+        std::printf("\n");
+    }
+    if (sim.cueScratch)
+        std::printf("WARNING: cue ball scratches - use draw/stun, softer power "
+                    "or another aim\n");
+    std::printf("cue rests at logical (%.0f,%.0f) after %.2f s\n",
+                sim.final[cueIdx].pos.x, sim.final[cueIdx].pos.y, sim.duration);
+
+    // ----- annotated image --------------------------------------------------
+    Image ann = img;
+    drawRect(ann, det.feltRect, {90, 190, 90}, 1);
+    Vec2 cuePx = det.balls[cueIdx].px;
+    Vec2 pd{dirL.x * f.w() / tbl.w, dirL.y * f.h() / tbl.h};
+    pd = pd.len() > 1e-12 ? pd.norm() : Vec2{1, 0};
+    double rayLen = std::hypot(f.w(), f.h());
+    drawLine(ann, cuePx, cuePx + pd * rayLen, {255, 255, 255}, 1, true, 10);
+    static const Rgb simPal[6] = {
+        {255, 255, 255}, {255, 210, 40}, {60, 200, 255},
+        {120, 255, 120}, {255, 120, 80}, {230, 120, 255}};
+    for (size_t i = 0; i < sim.paths.size(); ++i) {
+        const Rgb col = simPal[i % 6];
+        for (size_t k = 0; k + 1 < sim.paths[i].size(); ++k)
+            drawLine(ann, toPx(sim.paths[i][k]), toPx(sim.paths[i][k + 1]), col,
+                     1, true, 7);
+        const auto& fb = sim.final[i];
+        if (fb.active)
+            drawCircle(ann, toPx(fb.pos), balls[i].r * f.w() / tbl.w, col, 1,
+                       true);
+    }
+    for (const auto& e : sim.events) {
+        if (e.kind != "pot" || e.other < 0 ||
+            e.other >= static_cast<int>(tbl.pockets.size()))
+            continue;
+        drawCircle(ann, toPx(tbl.pockets[e.other].pos), 6, {255, 255, 0}, 2);
+    }
+    std::string annPath =
+        (fs::path(outDir) / (baseName + "_sim_annotated.png")).string();
+    if (!saveImage(annPath, ann)) {
+        std::fprintf(stderr, "failed to save %s\n", annPath.c_str());
+        return 1;
+    }
+
+    // ----- result JSON ------------------------------------------------------
+    std::string pottedStr;
+    for (size_t i = 0; i < sim.potted.size(); ++i)
+        pottedStr += (i ? "," : "") + std::to_string(sim.potted[i]);
+    JsonWriter j;
+    j.beginObj()
+        .kv("tool", "pool-vision-trainer")
+        .kv("kind", "simulation")
+        .beginObj("aim")
+            .kv("source", aimSource)
+            .kvNum("deg", aimDeg, 1)
+            .kvNum("power", power, 2)
+            .kvNum("contact_x", spinS, 2)
+            .kvNum("contact_y", spinF, 2)
+        .endObj()
+        .beginObj("outcome")
+            .kvInt("first_contact", sim.firstContact)
+            .kv("potted", pottedStr)
+            .kvBool("cue_scratch", sim.cueScratch)
+            .kvNum("cue_rest_x", sim.final[cueIdx].pos.x, 1)
+            .kvNum("cue_rest_y", sim.final[cueIdx].pos.y, 1)
+            .kvNum("duration_s", sim.duration, 2)
+        .endObj()
+        .beginArr("balls_final");
+    for (size_t i = 0; i < sim.final.size(); ++i) {
+        j.beginObj()
+            .kvInt("id", balls[i].id)
+            .kvNum("x", sim.final[i].pos.x, 1)
+            .kvNum("y", sim.final[i].pos.y, 1)
+            .kvBool("active", sim.final[i].active)
+        .endObj();
+    }
+    j.endArr().beginArr("events");
+    for (const auto& e : sim.events) {
+        j.beginObj()
+            .kvNum("t", e.t, 3)
+            .kv("kind", e.kind)
+            .kvInt("ball", e.ball)
+            .kvInt("other", e.other)
+            .kvRaw("pos", jsonVec2(e.pos.x, e.pos.y, 1))
+        .endObj();
+    }
+    j.endArr().endObj();
+    std::string jsonPath =
+        (fs::path(outDir) / (baseName + "_sim_result.json")).string();
+    FILE* fj = std::fopen(jsonPath.c_str(), "w");
+    if (!fj) {
+        std::fprintf(stderr, "failed to write %s\n", jsonPath.c_str());
+        return 1;
+    }
+    std::fputs(j.str().c_str(), fj);
+    std::fputs("\n", fj);
+    std::fclose(fj);
+    std::printf("wrote %s\n", annPath.c_str());
+    std::printf("wrote %s\n", jsonPath.c_str());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -361,11 +612,35 @@ int main(int argc, char** argv) {
         return runPipeline(img, table, a.out, base, a.maxRails, a.top);
     }
 
+    if (a.cmd == "simulate") {
+        if (a.in.empty()) {
+            std::fprintf(stderr, "usage: pool-trainer simulate <image> [options]\n");
+            return 2;
+        }
+        Image img;
+        try {
+            img = loadImage(a.in);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s\n", e.what());
+            return 1;
+        }
+        TableSpec table = TableSpec::standard();
+        table.w = a.tableW;
+        table.h = a.tableH;
+        table.pockets = TableSpec::standard().pockets;
+        fs::path p(a.in);
+        std::string base = p.stem().string();
+        return runSimulate(img, table, a.out, base, a);
+    }
+
     std::fprintf(stderr,
                  "usage:\n"
                  "  pool-trainer demo [--out DIR] [--seed N] [--max-rails N]\n"
                  "  pool-trainer analyze <image> [--out DIR] [--table WxH]"
                  " [--max-rails N] [--top N]\n"
+                 "  pool-trainer simulate <image> [--out DIR] [--table WxH]"
+                 " [--power P] [--contact DX,DY] [--dir DEG] [--shot N]"
+                 " [--max-rails N]\n"
                  "  pool-trainer version\n");
     return a.cmd.empty() ? (a.in.empty() ? 0 : 2) : 2;
 }

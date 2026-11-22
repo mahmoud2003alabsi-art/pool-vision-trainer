@@ -19,7 +19,9 @@
 #include <shellapi.h>
 #include "pool/vision.hpp"
 #include "pool/solver.hpp"
+#include "pool/physics.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cwctype>
 #include <exception>
@@ -254,6 +256,81 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
     ReleaseDC(g_ov, dc);
 }
 
+// Live simulation preview: the game's own aim guideline was detected, so show
+// what the CURRENT aim will do — every ball's predicted path, the rest
+// positions and a pocket flash (yellow = object potted, red = scratch).
+void drawSimPreview(const pool::DetectResult& det, const std::vector<pool::Ball>& balls,
+                    const pool::SimResult& sim, pool::Vec2 dirPx) {
+    if (!g_ov) return;
+    RECT rc;
+    GetClientRect(g_ov, &rc);
+    HDC dc = GetDC(g_ov);
+    fillKey(dc, rc);
+    if (g_visible && !sim.final.empty() && balls.size() == sim.final.size()) {
+        pool::Rect f = det.feltRect;  // same +/-2 shrink detection mapped with
+        f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
+        const pool::TableSpec& tbl = det.table;
+        auto toPx = [&](pool::Vec2 l) {
+            return POINT{static_cast<LONG>(f.x0 + l.x / tbl.w * f.w()),
+                         static_cast<LONG>(f.y0 + l.y / tbl.h * f.h())};
+        };
+        // Extend the aim ray from the cue ball in pixel space.
+        for (size_t i = 0; i < balls.size(); ++i) {
+            if (balls[i].id != 0) continue;
+            POINT c{static_cast<LONG>(det.balls[i].px.x),
+                    static_cast<LONG>(det.balls[i].px.y)};
+            const double len = std::hypot(f.w(), f.h());
+            HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+            HGDIOBJ old = SelectObject(dc, pen);
+            MoveToEx(dc, c.x, c.y, nullptr);
+            LineTo(dc, c.x + static_cast<LONG>(dirPx.x * len),
+                   c.y + static_cast<LONG>(dirPx.y * len));
+            SelectObject(dc, old);
+            DeleteObject(pen);
+            break;
+        }
+        // Predicted paths (thin) + rest positions (hollow rings).
+        const COLORREF pal[6] = {RGB(255, 255, 255), RGB(255, 210, 40),
+                                 RGB(60, 200, 255),  RGB(120, 255, 120),
+                                 RGB(255, 120, 80),  RGB(230, 120, 255)};
+        for (size_t i = 0; i < sim.paths.size(); ++i) {
+            const COLORREF col = pal[i % 6];
+            HPEN pen = CreatePen(PS_SOLID, 1, col);
+            HGDIOBJ old = SelectObject(dc, pen);
+            for (size_t k = 0; k + 1 < sim.paths[i].size(); ++k) {
+                POINT a = toPx(sim.paths[i][k]), b = toPx(sim.paths[i][k + 1]);
+                MoveToEx(dc, a.x, a.y, nullptr);
+                LineTo(dc, b.x, b.y);
+            }
+            SelectObject(dc, old);
+            DeleteObject(pen);
+            if (sim.final[i].active) {
+                POINT p = toPx(sim.final[i].pos);
+                HPEN ring = CreatePen(PS_SOLID, 1, col);
+                HGDIOBJ o2 = SelectObject(dc, ring);
+                HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Ellipse(dc, p.x - 6, p.y - 6, p.x + 6, p.y + 6);
+                SelectObject(dc, ob);
+                SelectObject(dc, o2);
+            }
+        }
+        // Pocket flashes for potted balls.
+        for (const auto& e : sim.events) {
+            if (e.kind != "pot") continue;
+            if (e.other < 0 || e.other >= static_cast<int>(tbl.pockets.size()))
+                continue;
+            POINT p = toPx(tbl.pockets[e.other].pos);
+            HBRUSH br = CreateSolidBrush(e.ball == 0 ? RGB(255, 60, 60)
+                                                     : RGB(255, 255, 0));
+            HGDIOBJ ob = SelectObject(dc, br);
+            Ellipse(dc, p.x - 7, p.y - 7, p.x + 7, p.y + 7);
+            SelectObject(dc, ob);
+            DeleteObject(br);
+        }
+    }
+    ReleaseDC(g_ov, dc);
+}
+
 }  // namespace
 
 int main() {
@@ -341,13 +418,48 @@ int main() {
                         if (d.kind == "cue" && cueIdx < 0) cueIdx = static_cast<int>(i);
                         balls.push_back(b);
                     }
-                    std::vector<pool::Shot> shots;
+                    // Aim-aware preview: while the player drags, the game draws
+                    // its white guideline — predict the CURRENT aim's outcome
+                    // with the physics sim. Idle frames show best-shot guides.
+                    bool drewSim = false;
                     if (cueIdx >= 0 && balls.size() >= 2) {
+                        std::vector<pool::Vec2> otherPx;
+                        for (size_t i = 0; i < det.balls.size(); ++i)
+                            if (static_cast<int>(i) != cueIdx)
+                                otherPx.push_back(det.balls[i].px);
+                        pool::Vec2 dirPx;
+                        if (pool::estimateAimDirPx(cap, det.balls[cueIdx].px,
+                                                   det.ballRPx, otherPx, dirPx)) {
+                            pool::Rect f = det.feltRect;
+                            f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
+                            pool::Vec2 dirL{dirPx.x * det.table.w / f.w(),
+                                            dirPx.y * det.table.h / f.h()};
+                            dirL = dirL.len() > 1e-12 ? dirL.norm()
+                                                      : pool::Vec2{1, 0};
+                            double power = pool::minPotPower(det.table, balls,
+                                                             dirL, 0, 0);
+                            if (power < 0) power = 1.0;
+                            pool::SimResult sim = pool::simulate(
+                                det.table, balls,
+                                dirL * (pool::PhysicsParams{}.maxShotSpeed * power),
+                                0, 0);
+                            drawSimPreview(det, balls, sim, dirPx);
+                            drewSim = true;
+                            if (frame % 24 == 0)
+                                std::printf(
+                                    "[aim] deg=%.0f power=%.2f potted=%d scratch=%d\n",
+                                    std::atan2(dirL.y, dirL.x) * 180.0 / 3.14159265358979323846,
+                                    power, static_cast<int>(sim.potted.size()),
+                                    sim.cueScratch ? 1 : 0);
+                        }
+                    }
+                    std::vector<pool::Shot> shots;
+                    if (!drewSim && cueIdx >= 0 && balls.size() >= 2) {
                         pool::Solver solver(det.table, balls, cueIdx,
                                             pool::SolverOptions{g_args.rails, 80.0, 0.98});
                         shots = solver.allShots();
                     }
-                    drawGuides(det, shots, g_args.shots);
+                    if (!drewSim) drawGuides(det, shots, g_args.shots);
                     analyzed = true;
                     if (frame % 24 == 0)
                         std::printf("[ok] balls=%d shots=%d best=%s\n",

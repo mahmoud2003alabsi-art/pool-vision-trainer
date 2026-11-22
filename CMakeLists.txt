@@ -12,10 +12,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-O2 -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# Dependency-free core: geometry + solver (used by tests too).
+# Dependency-free core: geometry + solver + physics (used by tests too).
 add_library(poolcore
   src/geom.cpp
   src/solver.cpp
+  src/physics.cpp
 )
 target_include_directories(poolcore PUBLIC include)
 
@@ -36,6 +37,9 @@ target_link_libraries(pool-trainer PRIVATE poolvision)
 add_executable(pool_tests tests/test_solver.cpp)
 target_link_libraries(pool_tests PRIVATE poolcore)
 
+add_executable(pool_tests_physics tests/test_physics.cpp)
+target_link_libraries(pool_tests_physics PRIVATE poolcore)
+
 # Windows-only live aim overlay (Win32 + GDI; reuses poolvision).
 if(WIN32)
   add_executable(pool-overlay overlay/pool_overlay.cpp)
@@ -52,6 +56,8 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     -static -static-libgcc -static-libstdc++)
   target_link_options(pool_tests PRIVATE
     -static -static-libgcc -static-libstdc++)
+  target_link_options(pool_tests_physics PRIVATE
+    -static -static-libgcc -static-libstdc++)
   if(TARGET pool-overlay)
     target_link_options(pool-overlay PRIVATE
       -static -static-libgcc -static-libstdc++)
@@ -60,3 +66,4 @@ endif()
 
 enable_testing()
 add_test(NAME solver_tests COMMAND pool_tests)
+add_test(NAME physics_tests COMMAND pool_tests_physics)

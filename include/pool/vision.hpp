@@ -71,4 +71,11 @@ struct DetectResult {
 DetectResult detectBalls(const Image& img, const DetectOptions& opt = {},
                          const TableSpec& logical = TableSpec::standard());
 
+// Estimate the in-game aim direction from the white guideline radiating from
+// the cue ball (games draw it while aiming). Returns true and fills dirPx
+// (unit vector in image pixel axes, y down) when a line-like white ray is
+// found; otherBallPx are pixel positions to skip while sampling the ray.
+bool estimateAimDirPx(const Image& img, Vec2 cuePx, double ballRPx,
+                      const std::vector<Vec2>& otherBallPx, Vec2& dirPx);
+
 }  // namespace pool
