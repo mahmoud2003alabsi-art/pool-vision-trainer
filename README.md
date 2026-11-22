@@ -104,9 +104,15 @@ git remote add origin https://github.com/<USER>/<REPO>.git
 git push -u origin main        # أو: gh repo create --public --source=. --push
 ```
 
-2. افتح تبويب **Actions** في المستودع — سترى "CI" يبني المشروع ويشغّل الاختبارات
-   ويستخرج ديمو كامل (طاولة مولّدة → كشف → حل → صور مشروحة).
-3. نزّل المخرجات من قسم **Artifacts** باسم `demo-results`.
+2. افتح تبويب **Actions** في المستودع — سترى "CI" يبني المشروع على **لينكس وويندوز**
+   ويشغّل الاختبارات ويستخرج ديمو كامل (طاولة مولّدة → كشف → حل → صور مشروحة).
+3. نزّل المخرجات من قسم **Artifacts** بعد انتهاء التشغيل:
+   - `pool-trainer-Windows` — التطبيق التنفيذي `pool-trainer.exe` + نتائج الديمو
+     (طاولة مولّدة، صور مشروحة، تقارير JSON)
+   - `pool-trainer-Linux` — نفس الشيء بنسخة لينكس
+4. لتشغيل الـ Action يدوياً في أي وقت: زر **Run workflow** في صفحة Actions.
+   ولتشغيل التطبيق بعد التنزيل: `pool-trainer demo --out demo` (ويندوز) ثم
+   افتح `demo/table_annotated.png`.
 
 ## حدود الأداة وإخلاء مسؤولية
 
