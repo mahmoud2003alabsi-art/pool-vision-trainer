@@ -797,8 +797,6 @@ static void drawMenu(HDC dc) {
 }
 
 void fillKey(HDC dc, const RECT& rc) {
-
-void fillKey(HDC dc, const RECT& rc) {
     HBRUSH bg = CreateSolidBrush(kKey);
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
