@@ -103,6 +103,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         return 1;
     }
 
+    TableSpec tbl = det.table;  // detected table (pockets snapped to real holes)
     std::cout << "table rect px: (" << det.feltRect.x0 << "," << det.feltRect.y0
               << ")-(" << det.feltRect.x1 << "," << det.feltRect.y1 << ")"
               << "  ballR_px=" << det.ballRPx << "\n";
@@ -124,7 +125,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         b.kind = d.kind;
         b.color = d.color;
         b.pos = d.logical;
-        b.r = table.ballR;
+        b.r = tbl.ballR;
         if (d.kind == "cue" && cueIdx < 0) cueIdx = static_cast<int>(i);
         balls.push_back(b);
     }
@@ -132,7 +133,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         std::fprintf(stderr, "warning: no cue ball detected; only geometry reports\n");
     }
 
-    Solver solver(table, balls, cueIdx, SolverOptions{maxRails, 80.0, 0.98});
+    Solver solver(tbl, balls, cueIdx, SolverOptions{maxRails, 80.0, 0.98});
     std::vector<Shot> shots = solver.allShots();
 
     std::cout << "\nshots found: " << shots.size() << " (top " << top << ")\n";
@@ -152,11 +153,11 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     Image ann = img;
     drawRect(ann, det.feltRect, {90, 190, 90}, 1);
     // Pocket markers.
-    for (const auto& pk : table.pockets) {
+    for (const auto& pk : tbl.pockets) {
         // Logical -> px mapping uses the felt rect.
-        double pxX = det.feltRect.x0 + pk.pos.x / table.w * det.feltRect.w();
-        double pxY = det.feltRect.y0 + pk.pos.y / table.h * det.feltRect.h();
-        drawCircle(ann, {pxX, pxY}, table.pocketR * det.feltRect.w() / table.w,
+        double pxX = det.feltRect.x0 + pk.pos.x / tbl.w * det.feltRect.w();
+        double pxY = det.feltRect.y0 + pk.pos.y / tbl.h * det.feltRect.h();
+        drawCircle(ann, {pxX, pxY}, tbl.pocketR * det.feltRect.w() / tbl.w,
                    {220, 90, 90}, 2);
     }
     // Balls + labels.
@@ -173,8 +174,8 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         Rgb col = shotColor(rank);
 
         auto toPx = [&](Vec2 logical) {
-            return Vec2{det.feltRect.x0 + logical.x / table.w * det.feltRect.w(),
-                        det.feltRect.y0 + logical.y / table.h * det.feltRect.h()};
+            return Vec2{det.feltRect.x0 + logical.x / tbl.w * det.feltRect.w(),
+                        det.feltRect.y0 + logical.y / tbl.h * det.feltRect.h()};
         };
 
         // Cue path (dashed) + ghost circle.
@@ -182,7 +183,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
             drawLine(ann, toPx(s.cuePath[k]), toPx(s.cuePath[k + 1]), col, 2,
                      true, 8);
         if (s.typeName != "kick")
-            drawCircle(ann, toPx(s.ghost), table.ballR * det.feltRect.w() / table.w,
+            drawCircle(ann, toPx(s.ghost), tbl.ballR * det.feltRect.w() / tbl.w,
                        col, 2);
         // Object path (solid) + bounce markers.
         for (size_t k = 0; k + 1 < s.objPath.size(); ++k)
@@ -195,7 +196,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         if (s.typeName == "direct") {
             Vec2 g = toPx(s.ghost);
             Vec2 tdir = s.tangentDir;
-            double scale = table.ballR * det.feltRect.w() / table.w * 2.2;
+            double scale = tbl.ballR * det.feltRect.w() / tbl.w * 2.2;
             drawLine(ann, g - tdir * scale, g + tdir * scale, {150, 150, 160}, 1,
                      true, 5);
         }
@@ -205,7 +206,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         if (s.typeName == "kick" && s.cuePath.size() >= 2)
             labelAt = toPx((s.cuePath[0] + s.cuePath[1]) / 2.0);
         else
-            labelAt = toPx(s.ghost) + Vec2{0, table.ballR * det.feltRect.w() / table.w + 6};
+            labelAt = toPx(s.ghost) + Vec2{0, tbl.ballR * det.feltRect.w() / tbl.w + 6};
         char buf[64];
         std::snprintf(buf, sizeof(buf), "#%d %s CUT=%.0f CONF=%.2f",
                       rank + 1, s.typeName.c_str(),
@@ -224,10 +225,10 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         .kv("tool", "pool-vision-trainer")
         .kv("version", "1.0.0")
         .beginObj("table")
-            .kvNum("w", table.w, 1)
-            .kvNum("h", table.h, 1)
-            .kvNum("ballR", table.ballR, 1)
-            .kvNum("pocketR", table.pocketR, 1)
+            .kvNum("w", tbl.w, 1)
+            .kvNum("h", tbl.h, 1)
+            .kvNum("ballR", tbl.ballR, 1)
+            .kvNum("pocketR", tbl.pocketR, 1)
         .endObj()
         .beginObj("detection")
             .kvNum("felt_rect_x0", det.feltRect.x0, 1)
@@ -281,7 +282,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
                 double dist = d.logical.dist(gb.pos);
                 if (dist < best) { best = dist; bd = &d; }
             }
-            bool ok = bd && best < table.ballR * 1.5 && bd->number == gb.number;
+            bool ok = bd && best < tbl.ballR * 1.5 && bd->number == gb.number;
             if (ok) ++matched;
             j.beginObj()
                 .kvInt("number", gb.number)

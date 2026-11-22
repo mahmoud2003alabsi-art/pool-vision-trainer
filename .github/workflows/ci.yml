@@ -40,8 +40,10 @@ jobs:
       - name: Round-trip (analyze the generated table image)
         run: ./build/pool-trainer analyze artifacts/table.png --out artifacts/roundtrip
 
-      - name: Collect executable into artifacts
-        run: cp build/pool-trainer* artifacts/
+      - name: Collect executables into artifacts
+        run: |
+          cp build/pool-trainer* artifacts/
+          cp build/pool-overlay* artifacts/ || true
 
       - name: Upload (demo results + executable)
         uses: actions/upload-artifact@v4

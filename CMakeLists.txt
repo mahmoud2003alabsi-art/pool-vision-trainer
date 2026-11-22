@@ -36,5 +36,27 @@ target_link_libraries(pool-trainer PRIVATE poolvision)
 add_executable(pool_tests tests/test_solver.cpp)
 target_link_libraries(pool_tests PRIVATE poolcore)
 
+# Windows-only live aim overlay (Win32 + GDI; reuses poolvision).
+if(WIN32)
+  add_executable(pool-overlay overlay/pool_overlay.cpp)
+  target_include_directories(pool-overlay PRIVATE include)
+  target_link_libraries(pool-overlay PRIVATE poolvision user32 gdi32 shell32)
+  target_compile_definitions(pool-overlay PRIVATE
+    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Windows/MinGW: link statically so the exe runs without MinGW runtime DLLs
+# (libstdc++-6.dll, libgcc_s_seh-1.dll, libwinpthread-1.dll).
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+  target_link_options(pool-trainer PRIVATE
+    -static -static-libgcc -static-libstdc++)
+  target_link_options(pool_tests PRIVATE
+    -static -static-libgcc -static-libstdc++)
+  if(TARGET pool-overlay)
+    target_link_options(pool-overlay PRIVATE
+      -static -static-libgcc -static-libstdc++)
+  endif()
+endif()
+
 enable_testing()
 add_test(NAME solver_tests COMMAND pool_tests)

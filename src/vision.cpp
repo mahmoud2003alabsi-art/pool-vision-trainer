@@ -1,9 +1,10 @@
 // vision.cpp — segmentation, blob detection and HSV ball classification.
 //
 // Pipeline:
-//   1. RGB -> HSV; build the felt mask (green hue window).
-//   2. Largest 4-connected felt component -> playing-field rect.
-//   3. Inside the rect: "ball-ish" pixels = NOT felt.
+//   1. RGB -> HSV; build the surface mask (green felt window; if no
+//      table-sized green region exists, the dominant surface color).
+//   2. Largest 4-connected surface component -> playing-field rect.
+//   3. Inside the rect: "ball-ish" pixels = NOT surface.
 //   4. 8-connected components over ball-ish pixels -> blobs.
 //   5. Median blob area -> ball radius estimate; keep blobs of plausible size.
 //   6. Exclude blobs centered on the six pocket anchors.
@@ -190,6 +191,87 @@ int numberForColor(const std::string& color, bool stripe) {
     return stripe ? base + 8 : base;
 }
 
+// Largest 4-connected component of `mask`; returns its bounding rect.
+Rect largestComponent(const std::vector<uint8_t>& mask, int w, int h,
+                      long& areaOut) {
+    std::vector<uint8_t> visited(mask.size(), 0);
+    Rect best{0, 0, 0, 0};
+    long bestArea = 0;
+    for (size_t i = 0; i < mask.size(); ++i) {
+        if (mask[i] && !visited[i]) {
+            Rect r;
+            long a = 0;
+            floodFill(mask, w, h, static_cast<int>(i % w),
+                      static_cast<int>(i / w), visited, r, a);
+            if (a > bestArea) { bestArea = a; best = r; }
+        }
+    }
+    areaOut = bestArea;
+    return best;
+}
+
+// A pool-table rect must be big enough and roughly 2:1 (games crop a bit,
+// phone screenshots stretch) — guards against green/dominant UI accents.
+bool plausibleTableRect(const Rect& r, int w, int h) {
+    if (r.w() <= 0 || r.h() <= 0) return false;
+    double aspect = r.w() / r.h();
+    return r.w() * r.h() >= 0.06 * w * h && aspect >= 1.15 && aspect <= 2.8;
+}
+
+// Fallback for non-green tables (game screenshots with dark/gray felt):
+// quantize RGB, take the dominant surface color, mask everything within a
+// small tolerance and return the largest component's rect.
+Rect dominantSurfaceRect(const Image& img, std::vector<uint8_t>& surface) {
+    const int w = img.w, h = img.h;
+    const size_t n = static_cast<size_t>(w) * h;
+    std::vector<long> hist(16 * 16 * 16, 0);
+    for (size_t i = 0; i < n; ++i) {
+        int r = img.px[i * 3] >> 4, g = img.px[i * 3 + 1] >> 4,
+            b = img.px[i * 3 + 2] >> 4;
+        ++hist[(r << 8) | (g << 4) | b];
+    }
+    // Prefer non-black, non-white bins so a plain background cannot win;
+    // fall back to the plain dominant bin if everything is extreme.
+    int bestBin = -1;
+    long bestCnt = 0;
+    for (int pass = 0; pass < 2 && bestBin < 0; ++pass) {
+        for (int bin = 0; bin < 16 * 16 * 16; ++bin) {
+            int r = ((bin >> 8) & 15) * 16 + 8;
+            int g = ((bin >> 4) & 15) * 16 + 8;
+            int b = (bin & 15) * 16 + 8;
+            Hsv c = rgbToHsv(static_cast<unsigned char>(r),
+                             static_cast<unsigned char>(g),
+                             static_cast<unsigned char>(b));
+            bool dark = c.v < 0.07;
+            bool white = c.s < 0.10 && c.v > 0.93;
+            if (pass == 0 && (dark || white)) continue;
+            if (hist[bin] > bestCnt) { bestCnt = hist[bin]; bestBin = bin; }
+        }
+    }
+    // Match in HSV: shaded felts vary a lot in brightness (vignette) and get
+    // bluer (higher saturation) as they darken, while chroma direction stays
+    // stable. Compare saturation+value with generous windows, require a small
+    // absolute brightness floor (holes/background are near-black), and check
+    // hue only when both colors are actually colored.
+    Hsv dh = rgbToHsv(static_cast<unsigned char>(((bestBin >> 8) & 15) * 16 + 8),
+                      static_cast<unsigned char>(((bestBin >> 4) & 15) * 16 + 8),
+                      static_cast<unsigned char>((bestBin & 15) * 16 + 8));
+    for (size_t i = 0; i < n; ++i) {
+        Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
+        if (c.v < 0.10) continue;  // holes, deep shadows, black background
+        if (std::fabs(c.s - dh.s) > 0.25) continue;
+        if (std::fabs(c.v - dh.v) > 0.30) continue;
+        if (c.s >= 0.12 && dh.s >= 0.12) {
+            double hd = std::fabs(c.h - dh.h);
+            hd = std::min(hd, 360.0 - hd);
+            if (hd > 30.0) continue;
+        }
+        surface[i] = 1;
+    }
+    long area = 0;
+    return largestComponent(surface, w, h, area);
+}
+
 }  // namespace
 
 DetectResult detectBalls(const Image& img, const DetectOptions& opt,
@@ -198,51 +280,54 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     const int w = img.w, h = img.h;
     const size_t n = static_cast<size_t>(w) * h;
 
-    // 1. Felt mask.
-    std::vector<uint8_t> felt(n, 0);
+    // 1. Green felt mask (classic tables + the synthetic demo).
+    std::vector<uint8_t> surface(n, 0);
     for (size_t i = 0; i < n; ++i) {
         Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
         if (c.h >= opt.feltHueMin && c.h <= opt.feltHueMax &&
             c.s >= opt.feltSatMin && c.v >= opt.feltValMin)
-            felt[i] = 1;
+            surface[i] = 1;
     }
 
-    // 2. Largest felt component -> table rect.
-    std::vector<uint8_t> visited(n, 0);
-    Rect best{0, 0, 0, 0};
+    // 2. Largest green component -> candidate table rect. Game screenshots
+    // with a non-green felt only match this window on small UI accents, so
+    // the rect must actually look like a table; otherwise fall back to the
+    // dominant surface color (dark/gray felts).
     long bestArea = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (felt[i] && !visited[i]) {
-            Rect r;
-            long a = 0;
-            floodFill(felt, w, h, static_cast<int>(i % w),
-                      static_cast<int>(i / w), visited, r, a);
-            if (a > bestArea) { bestArea = a; best = r; }
-        }
+    Rect best = largestComponent(surface, w, h, bestArea);
+    bool usedFallback = false;
+    if (bestArea < 100 || !plausibleTableRect(best, w, h)) {
+        std::fill(surface.begin(), surface.end(), 0);
+        best = dominantSurfaceRect(img, surface);
+        usedFallback = true;
+        if (!plausibleTableRect(best, w, h))
+            throw std::runtime_error(
+                "no table region found - crop the table area from the "
+                "screenshot and try again");
     }
-    if (bestArea < 100)
-        throw std::runtime_error("no table (felt) region found");
 
     // Shrink a little to avoid the cushion/wood transition pixels.
     Rect field = best;
     field.x0 += 2; field.y0 += 2;
     field.x1 -= 2; field.y1 -= 2;
 
-    // 3. Ball-ish mask inside the field.
+    // 3. Ball-ish mask inside the field: anything not matching the surface.
     std::vector<uint8_t> ballish(n, 0);
     for (int y = static_cast<int>(field.y0); y < static_cast<int>(field.y1); ++y) {
         for (int x = static_cast<int>(field.x0); x < static_cast<int>(field.x1); ++x) {
             size_t i = static_cast<size_t>(y) * w + x;
-            if (!felt[i]) ballish[i] = 1;
+            if (!surface[i]) ballish[i] = 1;
         }
     }
 
     // 4. Blobs.
     std::vector<Blob> blobs = findBlobs(ballish, w, h);
 
-    // 5. Median area of plausible blobs -> ball radius. Pocket blobs are
-    // excluded from the statistics first (they sit on the six anchors) so
-    // they cannot skew the median.
+    // 5. Ball radius estimate.
+    //    Green path: median blob area (uniform felts -> blobs are the balls).
+    //    Fallback path (game screenshots): gradient felts create many noise
+    //    blobs that skew the median, so derive the expected radius from the
+    //    detected rect size instead (logical ballR scales with rect width).
     double minDim = std::min(field.w(), field.h());
     double pocketExclPre = 0.07 * minDim;
     Vec2 anchors[6] = {
@@ -254,20 +339,29 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             if (std::hypot(b.cx - a.x, b.cy - a.y) < rad) return true;
         return false;
     };
-    std::vector<long> areas;
-    for (const auto& b : blobs) {
-        if (b.area < opt.areaMin) continue;
-        if (nearAnyAnchor(b, pocketExclPre)) continue;
-        areas.push_back(b.area);
+    double ballR;
+    if (usedFallback) {
+        ballR = field.w() / logical.w * logical.ballR;
+        if (ballR < 2.0) ballR = 2.0;
+    } else {
+        std::vector<long> areas;
+        for (const auto& b : blobs) {
+            if (b.area < opt.areaMin) continue;
+            if (nearAnyAnchor(b, pocketExclPre)) continue;
+            areas.push_back(b.area);
+        }
+        if (areas.empty())
+            throw std::runtime_error("no ball-like blobs found inside the table");
+        std::sort(areas.begin(), areas.end());
+        double medA = areas[areas.size() / 2];
+        ballR = std::sqrt(medA / 3.14159265358979323846);
     }
-    if (areas.empty())
-        throw std::runtime_error("no ball-like blobs found inside the table");
-    std::sort(areas.begin(), areas.end());
-    double medA = areas[areas.size() / 2];
-    double ballR = std::sqrt(medA / 3.14159265358979323846);
 
-    // Final exclusion radius around the pocket anchors.
+    // Final exclusion radius around the pocket anchors. The kept-blob window
+    // below is expressed against the ball disc area (green path: the disc of
+    // the median blob, i.e. exactly the previous behavior).
     double pocketExcl = std::max(pocketExclPre, 3.04 * ballR);
+    double refArea = 3.14159265358979323846 * ballR * ballR;
 
     // 6+7. Keep plausible blobs, skip pockets, classify.
     DetectResult res;
@@ -275,11 +369,45 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     res.ballRPx = ballR;
     res.table = logical;
 
+    // Snap pocket anchors to the real pocket holes. Gradient felts make the
+    // detected rect cover the core felt only, so rect corners can sit a few
+    // pixels off the actual pockets (games draw dark round holes there).
+    // anchors[k] and table.pockets[k] share the same TL,TC,TR,BL,BC,BR order.
+    {
+        const double snapR = std::max(ballR, 0.055 * minDim);
+        for (int k = 0; k < 6 && k < static_cast<int>(res.table.pockets.size()); ++k) {
+            Vec2 a = anchors[k];
+            int sx0 = static_cast<int>(clampd(a.x - snapR, 0, w - 1.0));
+            int sx1 = static_cast<int>(clampd(a.x + snapR, 0, w - 1.0));
+            int sy0 = static_cast<int>(clampd(a.y - snapR, 0, h - 1.0));
+            int sy1 = static_cast<int>(clampd(a.y + snapR, 0, h - 1.0));
+            long cnt = 0;
+            double sx = 0, sy = 0;
+            for (int y = sy0; y <= sy1; ++y) {
+                for (int x = sx0; x <= sx1; ++x) {
+                    size_t i = static_cast<size_t>(y) * w + x;
+                    Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
+                                     img.px[i * 3 + 2]);
+                    if (c.v < 0.13) { ++cnt; sx += x; sy += y; }
+                }
+            }
+            if (cnt < 30) continue;
+            Vec2 s{sx / cnt, sy / cnt};
+            if (s.dist(a) > snapR) continue;
+            // Partial pull (60%) so a stray dark patch cannot drag a pocket.
+            Vec2 moved{a.x * 0.4 + s.x * 0.6, a.y * 0.4 + s.y * 0.6};
+            anchors[k] = moved;
+            res.table.pockets[k].pos = {
+                (moved.x - field.x0) / field.w() * logical.w,
+                (moved.y - field.y0) / field.h() * logical.h};
+        }
+    }
+
     struct Raw { Blob b; };
     std::vector<Raw> kept;
     for (const auto& b : blobs) {
         if (b.area < opt.areaMin) continue;
-        if (b.area < medA * opt.areaLoFactor || b.area > medA * opt.areaHiFactor)
+        if (b.area < refArea * opt.areaLoFactor || b.area > refArea * opt.areaHiFactor)
             continue;
         bool nearPocket = false;
         for (const auto& a : anchors)
