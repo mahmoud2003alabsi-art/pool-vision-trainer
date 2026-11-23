@@ -68,11 +68,28 @@ struct DetectOptions {
     bool stripLines = true;      // morphological aim-line removal
 };
 
+// Felt quad for perspective tables (Pool Club style trapezoids): corners in
+// image pixels, TL, TR, BR, BL order.
+struct Quad {
+    Vec2 tl, tr, br, bl;
+};
+
+// Bilinear mapping between a felt quad and the logical table. The inverse
+// solves the bilinear system with a damped Newton iteration, so shots
+// computed in logical space land exactly on the drawn table even when the
+// game renders it with perspective.
+Vec2 quadLogicalToPx(const Quad& q, const Vec2& l, double logicalW,
+                     double logicalH);
+Vec2 quadPxToLogical(const Quad& q, const Vec2& p, double logicalW,
+                     double logicalH);
+
 struct DetectResult {
     std::vector<Detection> balls;
     Rect feltRect;      // detected playing field, image pixels
     double ballRPx = 0; // median blob radius
     TableSpec table;    // logical table used for coordinate mapping
+    bool hasQuad = false;  // perspective-corrected felt quad available
+    Quad quadPx{};         // TL,TR,BR,BL in image pixels (hasQuad only)
 };
 
 // Detect the table and the balls. `logical` selects the logical table the

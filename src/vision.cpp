@@ -335,6 +335,130 @@ double inscribedDisc(const std::vector<uint8_t>& m, int w, int h, const Rect& bo
 
 }  // namespace
 
+// ---- perspective-corrected mapping (Pool Club style trapezoid felts) ----
+// (exported: declared in vision.hpp, used by tests and the overlay too)
+
+Vec2 quadLogicalToPx(const Quad& q, const Vec2& l, double lw, double lh) {
+    double u = clampd(l.x / lw, 0.0, 1.0);
+    double v = clampd(l.y / lh, 0.0, 1.0);
+    double w00 = (1 - u) * (1 - v), w10 = u * (1 - v);
+    double w01 = (1 - u) * v, w11 = u * v;
+    return {q.tl.x * w00 + q.tr.x * w10 + q.bl.x * w01 + q.br.x * w11,
+            q.tl.y * w00 + q.tr.y * w10 + q.bl.y * w01 + q.br.y * w11};
+}
+
+Vec2 quadPxToLogical(const Quad& q, const Vec2& p, double lw, double lh) {
+    // Newton on F(u,v) = bilinear(u,v) - p with an analytic Jacobian.
+    double u = 0.5, v = 0.5;
+    for (int it = 0; it < 12; ++it) {
+        double a = 1 - u, b = 1 - v;
+        double fx = q.tl.x * a * b + q.tr.x * u * b + q.bl.x * a * v +
+                    q.br.x * u * v - p.x;
+        double fy = q.tl.y * a * b + q.tr.y * u * b + q.bl.y * a * v +
+                    q.br.y * u * v - p.y;
+        double dxdu = (q.tr.x - q.tl.x) * b + (q.br.x - q.bl.x) * v;
+        double dxdv = (q.bl.x - q.tl.x) * a + (q.br.x - q.tr.x) * u;
+        double dydu = (q.tr.y - q.tl.y) * b + (q.br.y - q.bl.y) * v;
+        double dydv = (q.bl.y - q.tl.y) * a + (q.br.y - q.tr.y) * u;
+        double det = dxdu * dydv - dxdv * dydu;
+        if (std::fabs(det) < 1e-9) break;
+        double du = (fx * dydv - fy * dxdv) / det;
+        double dv = (fy * dxdu - fx * dydu) / det;
+        u = clampd(u - du, -0.2, 1.2);
+        v = clampd(v - dv, -0.2, 1.2);
+        if (std::fabs(du) + std::fabs(dv) < 1e-10) break;
+    }
+    return {clampd(u, 0.0, 1.0) * lw, clampd(v, 0.0, 1.0) * lh};
+}
+
+// Fit the felt's left/right edges as straight lines over the per-row spans
+// of the surface mask. Perspective tables draw the felt as a trapezoid, so
+// the inscribed rectangle hugs the narrow top edge and squeezes the whole
+// coordinate mapping; the quad restores it. Flat tables degenerate to the
+// rectangle (slopes ~0) and are rejected by the trapezoid gate.
+bool fitTrapezoid(const std::vector<uint8_t>& surface, int w, int h,
+                  const Rect& seed, Quad& q) {
+    int y0 = std::max(0, static_cast<int>(seed.y0) - 2);
+    int y1 = std::min(h - 1, static_cast<int>(seed.y1) + 2);
+    int wx0 = std::max(0, static_cast<int>(seed.x0 - 0.30 * seed.w()) - 8);
+    int wx1 = std::min(w - 1, static_cast<int>(seed.x1 + 0.30 * seed.w()) + 8);
+    std::vector<double> xmin, xmax, ys;
+    for (int y = y0; y <= y1; ++y) {
+        int lo = -1, hi = -1;
+        for (int x = wx0; x <= wx1; ++x)
+            if (surface[static_cast<size_t>(y) * w + x]) {
+                if (lo < 0) lo = x;
+                hi = x;
+            }
+        if (lo < 0) continue;
+        xmin.push_back(lo);
+        xmax.push_back(hi);
+        ys.push_back(y);
+    }
+    if (xmin.size() < 20) return false;
+    std::vector<double> spans;
+    for (size_t i = 0; i < xmin.size(); ++i)
+        spans.push_back(xmax[i] - xmin[i]);
+    std::vector<double> srt = spans;
+    std::sort(srt.begin(), srt.end());
+    double medSpan = srt[srt.size() / 2];
+    double maxSpan = srt.back();
+    // Least squares x = a + b*y over rows near the median span (felt body).
+    double lsx = 0, lsy = 0, lsyy = 0, lsxy = 0, rsx = 0, rsxy = 0;
+    long lcnt = 0, rcnt = 0;
+    for (size_t i = 0; i < ys.size(); ++i) {
+        if (spans[i] < 0.45 * medSpan) continue;
+        double y = ys[i];
+        lsx += xmin[i];
+        lsy += y;
+        lsyy += y * y;
+        lsxy += xmin[i] * y;
+        ++lcnt;
+        rsx += xmax[i];
+        rsxy += xmax[i] * y;
+        ++rcnt;
+    }
+    if (lcnt < 20 || rcnt < 20) return false;
+    auto fit = [](double sx, double sy, double syy, double sxy, long n,
+                  double& a, double& b) {
+        double d = static_cast<double>(n) * syy - sy * sy;
+        if (std::fabs(d) < 1e-6) {
+            a = sx / n;
+            b = 0;
+            return;
+        }
+        b = (static_cast<double>(n) * sxy - sx * sy) / d;
+        a = (sx - b * sy) / n;
+    };
+    double la, lb, ra, rb;
+    fit(lsx, lsy, lsyy, lsxy, lcnt, la, lb);
+    fit(rsx, lsy, lsyy, rsxy, rcnt, ra, rb);
+    if (std::fabs(lb) > 1.2 || std::fabs(rb) > 1.2) return false;
+    // Top/bottom of the felt: first/last row with a real span. A low gate
+    // (25%) is required here — a strong trapezoid's narrow edge can be well
+    // below half of the wide edge, and the quad must still start there.
+    double yTop = -1, yBot = -1;
+    for (size_t i = 0; i < ys.size(); ++i) {
+        if (spans[i] < 0.25 * maxSpan) continue;
+        if (yTop < 0) yTop = ys[i];
+        yBot = ys[i];
+    }
+    if (yTop < 0 || yBot - yTop < 0.4 * seed.h()) return false;
+    Quad cand;
+    cand.tl = {la + lb * yTop, yTop};
+    cand.tr = {ra + rb * yTop, yTop};
+    cand.bl = {la + lb * yBot, yBot};
+    cand.br = {ra + rb * yBot, yBot};
+    if (cand.tl.x >= cand.tr.x || cand.bl.x >= cand.br.x) return false;
+    // Trapezoid gate: only accept when the felt actually widens toward the
+    // bottom by more than 6% — flat tables keep the rectangle path.
+    double topW = cand.tr.x - cand.tl.x, botW = cand.br.x - cand.bl.x;
+    double wide = std::max(topW, botW), narrow = std::min(topW, botW);
+    if (wide - narrow < 0.06 * seed.w()) return false;
+    q = cand;
+    return true;
+}
+
 DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                          const TableSpec& logical) {
     if (img.empty()) throw std::runtime_error("empty image");
@@ -368,7 +492,33 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         best = opt.forceRect;
         usedFallback = true;
     } else {
-        best = largestComponent(surface, w, h, bestArea);
+        // In-game white aim lines and rail trays can cut the felt into
+        // components; a lightly dilated copy bridges the thin gaps so the
+        // largest component is the whole felt again. The original mask is
+        // kept for the ball pass (dilation must not eat ball edges).
+        std::vector<uint8_t> surfD = surface;
+        for (int it = 0; it < 2; ++it) {
+            std::vector<uint8_t> nxt = surfD;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    size_t i = static_cast<size_t>(y) * w + x;
+                    if (surfD[i]) continue;
+                    bool nb = false;
+                    for (int dy = -1; dy <= 1 && !nb; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            int nx = x + dx, ny = y + dy;
+                            if (nx < 0 || ny < 0 || nx >= w || ny >= h)
+                                continue;
+                            if (surfD[static_cast<size_t>(ny) * w + nx]) {
+                                nb = true;
+                                break;
+                            }
+                        }
+                    if (nb) nxt[i] = 1;
+                }
+            surfD = std::move(nxt);
+        }
+        best = largestComponent(surfD, w, h, bestArea);
         if (bestArea < 100 || !plausibleTableRect(best, w, h)) {
             std::fill(surface.begin(), surface.end(), 0);
             best = dominantSurfaceRect(img, surface, opt, &feltHue);
@@ -385,12 +535,36 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     field.x0 += 2; field.y0 += 2;
     field.x1 -= 2; field.y1 -= 2;
 
+    // Perspective fit (green auto path only): Pool Club style felts are
+    // trapezoids; the quad + bilinear mapping keeps every line on measure.
+    Quad quad{};
+    bool hasQuad = false;
+    if (!manual && !usedFallback)
+        hasQuad = fitTrapezoid(surface, w, h, best, quad);
+
     // 3. Ball-ish mask inside the field: anything not matching the surface.
+    // With a quad, balls near the wide end of the trapezoid sit outside the
+    // inscribed rectangle, so scan the quad rows instead.
     std::vector<uint8_t> ballish(n, 0);
-    for (int y = static_cast<int>(field.y0); y < static_cast<int>(field.y1); ++y) {
-        for (int x = static_cast<int>(field.x0); x < static_cast<int>(field.x1); ++x) {
-            size_t i = static_cast<size_t>(y) * w + x;
-            if (!surface[i]) ballish[i] = 1;
+    {
+        int sy0 = hasQuad ? static_cast<int>(quad.tl.y)
+                          : static_cast<int>(field.y0);
+        int sy1 = hasQuad ? static_cast<int>(quad.bl.y)
+                          : static_cast<int>(field.y1);
+        for (int y = sy0; y < sy1; ++y) {
+            int lo = static_cast<int>(field.x0);
+            int hi = static_cast<int>(field.x1);
+            if (hasQuad) {
+                double t = (y - quad.tl.y) /
+                           std::max(1.0, quad.bl.y - quad.tl.y);
+                lo = static_cast<int>(quad.tl.x + (quad.bl.x - quad.tl.x) * t);
+                hi = static_cast<int>(quad.tr.x + (quad.br.x - quad.tr.x) * t);
+            }
+            for (int x = lo; x < hi; ++x) {
+                if (x < 0 || x >= w) continue;
+                size_t i = static_cast<size_t>(y) * w + x;
+                if (!surface[i]) ballish[i] = 1;
+            }
         }
     }
 
@@ -465,10 +639,24 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     //    detected rect size instead (logical ballR scales with rect width).
     double minDim = std::min(field.w(), field.h());
     double pocketExclPre = 0.07 * minDim;
-    Vec2 anchors[6] = {
-        {field.x0, field.y0}, {(field.x0 + field.x1) / 2, field.y0},
-        {field.x1, field.y0}, {field.x0, field.y1},
-        {(field.x0 + field.x1) / 2, field.y1}, {field.x1, field.y1}};
+    // Pocket anchors: quad corners + edge midpoints (TL,TC,TR,BL,BC,BR) or
+    // the rectangle corners when no perspective fit was accepted.
+    Vec2 anchors[6];
+    if (hasQuad) {
+        anchors[0] = quad.tl;
+        anchors[1] = {(quad.tl.x + quad.tr.x) / 2, quad.tl.y};
+        anchors[2] = quad.tr;
+        anchors[3] = quad.bl;
+        anchors[4] = {(quad.bl.x + quad.br.x) / 2, quad.bl.y};
+        anchors[5] = quad.br;
+    } else {
+        anchors[0] = {field.x0, field.y0};
+        anchors[1] = {(field.x0 + field.x1) / 2, field.y0};
+        anchors[2] = {field.x1, field.y0};
+        anchors[3] = {field.x0, field.y1};
+        anchors[4] = {(field.x0 + field.x1) / 2, field.y1};
+        anchors[5] = {field.x1, field.y1};
+    }
     auto nearAnyAnchor = [&](const Blob& b, double rad) {
         for (const auto& a : anchors)
             if (std::hypot(b.cx - a.x, b.cy - a.y) < rad) return true;
@@ -490,8 +678,20 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         if (areas.empty())
             throw std::runtime_error("no ball-like blobs found inside the table");
         std::sort(areas.begin(), areas.end());
-        double medA = areas[areas.size() / 2];
-        ballR = std::sqrt(medA / 3.14159265358979323846);
+        // 25th percentile: single balls dominate the small end, while merged
+        // clusters (Pool Club style) inflate the median and made every
+        // circle oversize. Flat-table games are all singles, so p25 == median.
+        double p25A = areas[areas.size() / 4];
+        ballR = std::sqrt(p25A / 3.14159265358979323846);
+        // Clamp against the table-size expectation (rect/quad width scales
+        // the logical ballR) so noise specks and merged blobs cannot drift.
+        double scaleW = hasQuad
+                            ? ((quad.tr.x - quad.tl.x) +
+                               (quad.br.x - quad.bl.x)) / 2
+                            : field.w();
+        double expectedR = scaleW / logical.w * logical.ballR;
+        if (expectedR > 2.0)
+            ballR = clampd(ballR, 0.55 * expectedR, 1.45 * expectedR);
     }
 
     // Final exclusion radius around the pocket anchors. The kept-blob window
@@ -505,6 +705,8 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     res.feltRect = best;
     res.ballRPx = ballR;
     res.table = logical;
+    res.hasQuad = hasQuad;
+    res.quadPx = quad;
 
     // Snap pocket anchors to the real pocket holes. Gradient felts make the
     // detected rect cover the core felt only, so rect corners can sit a few
@@ -534,9 +736,10 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             // Partial pull (60%) so a stray dark patch cannot drag a pocket.
             Vec2 moved{a.x * 0.4 + s.x * 0.6, a.y * 0.4 + s.y * 0.6};
             anchors[k] = moved;
-            res.table.pockets[k].pos = {
-                (moved.x - field.x0) / field.w() * logical.w,
-                (moved.y - field.y0) / field.h() * logical.h};
+            res.table.pockets[k].pos =
+                hasQuad ? quadPxToLogical(quad, moved, logical.w, logical.h)
+                        : Vec2{(moved.x - field.x0) / field.w() * logical.w,
+                               (moved.y - field.y0) / field.h() * logical.h};
         }
     }
 
@@ -615,7 +818,9 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         if (nearPocket) continue;
         bool dup = false;
         for (const auto& k : kept) {
-            if (std::hypot(k.b.cx - c.cx, k.b.cy - c.cy) < 0.8 * ballR) {
+            // 1.05 * ballR: same-ball duplicates from aim-line splits sit
+            // closer than this; real touching balls sit ~2 radii apart.
+            if (std::hypot(k.b.cx - c.cx, k.b.cy - c.cy) < 1.05 * ballR) {
                 dup = true;
                 break;
             }
@@ -632,6 +837,11 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         double sumS = 0, sumV = 0, sumColV = 0;
         int hist[24] = {0};
         long total = 0;
+        // Center disc for the cue decision: when the blob radius runs large
+        // (merged clusters), the full disc bleeds into the felt and a pure
+        // white cue ball drops below the 0.80 gate. The ball CENTER is
+        // always white for a real cue ball, colored for a stripe ball.
+        long cwhite = 0, ctot = 0;
         int x0 = static_cast<int>(b.cx - ir), x1 = static_cast<int>(b.cx + ir);
         int y0 = static_cast<int>(b.cy - ir), y1 = static_cast<int>(b.cy + ir);
         for (int y = y0; y <= y1; ++y) {
@@ -656,11 +866,27 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             }
         }
         if (total == 0) continue;
+        int cir = static_cast<int>(std::max(1.0, r * 0.60));
+        for (int y = static_cast<int>(b.cy) - cir;
+             y <= static_cast<int>(b.cy) + cir; ++y) {
+            for (int x = static_cast<int>(b.cx) - cir;
+                 x <= static_cast<int>(b.cx) + cir; ++x) {
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                double dx = x - b.cx, dy = y - b.cy;
+                if (dx * dx + dy * dy > cir * cir) continue;
+                size_t i = static_cast<size_t>(y) * w + x;
+                Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
+                                 img.px[i * 3 + 2]);
+                ++ctot;
+                if (c.s < opt.cueSatMax && c.v > opt.cueValMin) ++cwhite;
+            }
+        }
         Detection d;
         d.px = {b.cx, b.cy};
         d.rPx = r;
         d.area = static_cast<double>(b.area);
         d.whiteRatio = static_cast<double>(whiteCnt) / total;
+        double centerWhite = ctot > 0 ? static_cast<double>(cwhite) / ctot : 0.0;
         d.sat = sumS / total;
         d.val = sumV / total;
         int hueBin = static_cast<int>(std::max_element(hist, hist + 24) - hist);
@@ -670,7 +896,10 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
 
         if (blackRatio > 0.55) {
             d.kind = "black"; d.color = "black"; d.number = 8;
-        } else if (d.whiteRatio > 0.80) {
+        } else if (d.whiteRatio > 0.80 || centerWhite > 0.72) {
+            // 0.72 center gate: the ball center is white for a real cue
+            // ball even when a salvaged/merged blob sits a few px off, and
+            // colored for stripe/solid balls (their band crosses the center).
             d.kind = "cue"; d.color = "white"; d.number = 0;
         } else if (d.whiteRatio > opt.stripeWhiteMin) {
             d.kind = "stripe";
@@ -691,9 +920,12 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             std::fabs(d.val - feltHue.v) < 0.30 && fhd < 15.0)
             continue;
 
-        // Logical mapping (affine stretch of the felt rect onto the table).
-        d.logical.x = (b.cx - field.x0) / field.w() * logical.w;
-        d.logical.y = (b.cy - field.y0) / field.h() * logical.h;
+        // Logical mapping: perspective-corrected through the felt quad when
+        // available, affine rect stretch otherwise.
+        d.logical = hasQuad
+                        ? quadPxToLogical(quad, d.px, logical.w, logical.h)
+                        : Vec2{(b.cx - field.x0) / field.w() * logical.w,
+                               (b.cy - field.y0) / field.h() * logical.h};
         res.balls.push_back(d);
     }
 
@@ -808,20 +1040,69 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         }
     }
 
-    // Exactly one cue: keep the biggest white blob, demote the others.
-    int cueCount = 0;
-    int bestCue = -1;
-    for (int i = 0; i < static_cast<int>(res.balls.size()); ++i) {
-        if (res.balls[i].kind == "cue") {
-            ++cueCount;
-            if (bestCue < 0 || res.balls[i].area > res.balls[bestCue].area)
+    // Exactly one cue. White stats alone cannot always tell the cue from a
+    // white object ball inside a cluster (Pool Club draws both as white
+    // discs), but the CUE ALWAYS SITS ALONE while aiming. Choose the
+    // white-ish ball with the largest nearest-neighbor distance; demote the
+    // rest back to stripe/solid by their hue.
+    {
+        int n = static_cast<int>(res.balls.size());
+        auto nnDist = [&](int i) {
+            double best = 1e18;
+            for (int j = 0; j < n; ++j) {
+                if (j == i) continue;
+                double d = std::hypot(res.balls[i].px.x - res.balls[j].px.x,
+                                      res.balls[i].px.y - res.balls[j].px.y);
+                if (d < best) best = d;
+            }
+            return best;
+        };
+        int bestCue = -1;
+        double bestIso = -1;
+        for (int i = 0; i < n; ++i) {
+            const auto& d = res.balls[i];
+            bool whiteish =
+                d.kind == "cue" || d.kind == "unknown" ||
+                d.whiteRatio > 0.45;
+            if (!whiteish) continue;
+            double iso = nnDist(i);
+            if (iso > bestIso) {
+                bestIso = iso;
                 bestCue = i;
+            }
         }
-    }
-    if (cueCount > 1) {
-        for (int i = 0; i < static_cast<int>(res.balls.size()); ++i) {
-            if (i == bestCue) continue;
-            if (res.balls[i].kind == "cue") {
+        if (bestCue >= 0 && bestIso > 2.0 * ballR) {
+            for (int i = 0; i < n; ++i) {
+                auto& d = res.balls[i];
+                if (i == bestCue) {
+                    d.kind = "cue";
+                    d.color = "white";
+                    d.number = 0;
+                    continue;
+                }
+                if (d.kind == "cue" || d.kind == "unknown") {
+                    // Demote: white-heavy -> stripe, else solid by hue.
+                    if (d.whiteRatio > opt.stripeWhiteMin) {
+                        d.kind = "stripe";
+                        d.color = colorName(d.hue, d.val);
+                        d.number = numberForColor(d.color, true);
+                    } else {
+                        d.kind = "solid";
+                        d.color = colorName(d.hue, d.val);
+                        d.number = numberForColor(d.color, false);
+                    }
+                }
+            }
+        } else {
+            // No isolated white ball; keep the first classifier cue (if any)
+            // and demote the remaining extras.
+            int first = -1;
+            for (int i = 0; i < n; ++i) {
+                if (res.balls[i].kind != "cue") continue;
+                if (first < 0) {
+                    first = i;
+                    continue;
+                }
                 res.balls[i].kind = "unknown";
                 res.balls[i].number = -1;
             }

@@ -813,6 +813,9 @@ void clearOverlay() {
 
 // Draw the best shots' guides in client pixel coordinates. The overlay is
 // exactly the game client size, so client coords map 1:1.
+// Minimal drawing, as requested: ONLY the table border, the ball circles
+// and the shot lines. All mapping goes through the perspective quad when
+// the felt was fitted as a trapezoid, so lines land on the drawn table.
 void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& shots,
                 int topN) {
     if (!g_ov) return;
@@ -821,16 +824,62 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
     HDC dc = GetDC(g_ov);
     fillKey(dc, rc);
 
+    pool::Rect f = det.feltRect;  // same +/-2 shrink detection mapped with
+    f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
+    const pool::TableSpec& tbl = det.table;
+    auto toPx = [&](pool::Vec2 l) -> POINT {
+        if (det.hasQuad) {
+            pool::Vec2 p = pool::quadLogicalToPx(det.quadPx, l, tbl.w, tbl.h);
+            return POINT{static_cast<LONG>(p.x), static_cast<LONG>(p.y)};
+        }
+        return POINT{static_cast<LONG>(f.x0 + l.x / tbl.w * f.w()),
+                     static_cast<LONG>(f.y0 + l.y / tbl.h * f.h())};
+    };
+    auto scaleW = [&]() {
+        return det.hasQuad
+                   ? ((det.quadPx.tr.x - det.quadPx.tl.x) +
+                      (det.quadPx.br.x - det.quadPx.bl.x)) / 2
+                   : f.w();
+    };
+    const int ballPx = std::max(3, static_cast<int>(tbl.ballR * scaleW() / tbl.w));
+
+    // Table border (detected felt outline, perspective-corrected).
+    {
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(110, 195, 255));
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        if (det.hasQuad) {
+            POINT q[4] = {toPx({0, 0}), toPx({tbl.w, 0}), toPx({tbl.w, tbl.h}),
+                          toPx({0, tbl.h})};
+            Polygon(dc, q, 4);
+        } else {
+            Rectangle(dc, static_cast<LONG>(f.x0), static_cast<LONG>(f.y0),
+                      static_cast<LONG>(f.x1), static_cast<LONG>(f.y1));
+        }
+        SelectObject(dc, oldBr);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+    }
+    // Ball circles at the detected positions with the detected sizes.
+    // Merged cluster blobs report an inflated blob radius, so cap it at the
+    // table-scaled ball radius to keep every circle on the actual balls.
+    for (const auto& d : det.balls) {
+        double rCap = det.ballRPx * 1.30;
+        int r = std::max(3, static_cast<int>(std::min(d.rPx, rCap)));
+        HPEN pen = CreatePen(
+            PS_SOLID, 1, d.kind == "cue" ? RGB(255, 255, 255) : RGB(165, 205, 235));
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, static_cast<LONG>(d.px.x - r), static_cast<LONG>(d.px.y - r),
+                static_cast<LONG>(d.px.x + r), static_cast<LONG>(d.px.y + r));
+        SelectObject(dc, oldBr);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+    }
+
     if (g_visible && shots.size() >= 1 && det.balls.size() >= 1) {
-        pool::Rect f = det.feltRect;  // same +/-2 shrink detection mapped with
-        f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
-        const pool::TableSpec& tbl = det.table;
-        auto toPx = [&](pool::Vec2 l) {
-            return POINT{static_cast<LONG>(f.x0 + l.x / tbl.w * f.w()),
-                         static_cast<LONG>(f.y0 + l.y / tbl.h * f.h())};
-        };
-        const int ballPx = std::max(3, static_cast<int>(tbl.ballR * f.w() / tbl.w));
-        const int nDraw = std::min<int>(topN, static_cast<int>(shots.size()));
+        const int nDraw =
+            std::min<int>({topN, 3, static_cast<int>(shots.size())});
         const COLORREF cueCol[3] = {RGB(255, 255, 255), RGB(190, 190, 190),
                                     RGB(130, 130, 130)};
         for (int rank = nDraw - 1; rank >= 0; --rank) {
@@ -865,18 +914,6 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
                 Ellipse(dc, p.x - 5, p.y - 5, p.x + 5, p.y + 5);
                 SelectObject(dc, ob);
                 DeleteObject(yb);
-            }
-            // 90-degree tangent hint after contact (direct shots).
-            if (s.typeName == "direct") {
-                HPEN tp = CreatePen(PS_SOLID, 1, RGB(170, 170, 180));
-                SelectObject(dc, tp);
-                POINT g = toPx(s.ghost);
-                const int len = static_cast<int>(ballPx * 2.2);
-                MoveToEx(dc, g.x - static_cast<LONG>(s.tangentDir.x * len),
-                         g.y - static_cast<LONG>(s.tangentDir.y * len), nullptr);
-                LineTo(dc, g.x + static_cast<LONG>(s.tangentDir.x * len),
-                       g.y + static_cast<LONG>(s.tangentDir.y * len));
-                DeleteObject(tp);
             }
             SelectObject(dc, oldPen);
             DeleteObject(pen);
@@ -920,6 +957,11 @@ void drawSimPreview(const pool::DetectResult& det, const std::vector<pool::Ball>
         f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
         const pool::TableSpec& tbl = det.table;
         auto toPx = [&](pool::Vec2 l) {
+            if (det.hasQuad) {
+                pool::Vec2 p =
+                    pool::quadLogicalToPx(det.quadPx, l, tbl.w, tbl.h);
+                return POINT{static_cast<LONG>(p.x), static_cast<LONG>(p.y)};
+            }
             return POINT{static_cast<LONG>(f.x0 + l.x / tbl.w * f.w()),
                          static_cast<LONG>(f.y0 + l.y / tbl.h * f.h())};
         };
@@ -1190,10 +1232,28 @@ int main() {
                         pool::Vec2 dirPx;
                         if (pool::estimateAimDirPx(cap, det.balls[cueIdx].px,
                                                    det.ballRPx, otherPx, dirPx)) {
-                            pool::Rect f = det.feltRect;
-                            f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
-                            pool::Vec2 dirL{dirPx.x * det.table.w / f.w(),
-                                            dirPx.y * det.table.h / f.h()};
+                            pool::Vec2 dirL{dirPx.x, dirPx.y};
+                            {
+                                // Logical aim direction: map two pixel
+                                // points through the felt quad (or the rect
+                                // affine) and normalize the difference.
+                                pool::Vec2 cuePx = det.balls[cueIdx].px;
+                                pool::Vec2 tipPx{cuePx.x + dirPx.x * 40.0,
+                                                 cuePx.y + dirPx.y * 40.0};
+                                auto toLog = [&](pool::Vec2 p) {
+                                    if (det.hasQuad)
+                                        return pool::quadPxToLogical(
+                                            det.quadPx, p, det.table.w,
+                                            det.table.h);
+                                    pool::Rect fr = det.feltRect;
+                                    fr.x0 += 2; fr.y0 += 2;
+                                    fr.x1 -= 2; fr.y1 -= 2;
+                                    return pool::Vec2{
+                                        (p.x - fr.x0) / fr.w() * det.table.w,
+                                        (p.y - fr.y0) / fr.h() * det.table.h};
+                                };
+                                dirL = toLog(tipPx) - toLog(cuePx);
+                            }
                             dirL = dirL.len() > 1e-12 ? dirL.norm()
                                                       : pool::Vec2{1, 0};
                             double power = pool::minPotPower(det.table, balls,

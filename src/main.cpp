@@ -149,6 +149,12 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     }
 
     TableSpec tbl = det.table;  // detected table (pockets snapped to real holes)
+    if (det.hasQuad) {
+        const auto& q = det.quadPx;
+        std::cout << "felt quad px: TL(" << q.tl.x << "," << q.tl.y << ") TR("
+                  << q.tr.x << "," << q.tr.y << ") BR(" << q.br.x << ","
+                  << q.br.y << ") BL(" << q.bl.x << "," << q.bl.y << ")\n";
+    }
     std::cout << "table rect px: (" << det.feltRect.x0 << "," << det.feltRect.y0
               << ")-(" << det.feltRect.x1 << "," << det.feltRect.y1 << ")"
               << "  ballR_px=" << det.ballRPx << "\n";

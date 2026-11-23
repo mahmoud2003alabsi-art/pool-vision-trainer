@@ -71,3 +71,7 @@ add_test(NAME physics_tests COMMAND pool_tests_physics)
 add_executable(pool_tests_menu tests/test_menu.cpp)
 target_include_directories(pool_tests_menu PRIVATE overlay)
 add_test(NAME menu_tests COMMAND pool_tests_menu)
+
+add_executable(pool_tests_vision tests/test_vision.cpp)
+target_link_libraries(pool_tests_vision PRIVATE poolvision)
+add_test(NAME vision_tests COMMAND pool_tests_vision)
