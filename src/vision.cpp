@@ -14,6 +14,7 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <numeric>
@@ -240,8 +241,31 @@ Rect dominantSurfaceRect(const Image& img, std::vector<uint8_t>& surface,
     // the game window's dark UI chrome and navy background are the biggest
     // regions in windowed captures and must never win. Try (bright+saturated)
     // first, then mid, then the plain dominant bin.
+    //
+    // The count for each bin is SMOOTHED over its 26 RGB neighbors first:
+    // a gradient felt straddles several adjacent 16-step bins while a flat
+    // rail region lands in a single one, so raw counts let a smaller flat
+    // region beat the felt (this mis-picked red rails on one synthetic
+    // scene, then poisoned every median downstream). Summing the ridge
+    // recovers the true dominant COLOR REGION regardless of bin split —
+    // and makes the pick robust to gamma/HDR shifts on other screens.
     static const double kPassV[3] = {0.45, 0.30, 0.07};
     static const double kPassS[3] = {0.30, 0.22, 0.0};
+    std::vector<long> smooth(16 * 16 * 16, 0);
+    for (int bin = 0; bin < 16 * 16 * 16; ++bin) {
+        long sum = 0;
+        int r0 = (bin >> 8) & 15, g0 = (bin >> 4) & 15, b0 = bin & 15;
+        for (int dr = -1; dr <= 1; ++dr)
+            for (int dg = -1; dg <= 1; ++dg)
+                for (int db = -1; db <= 1; ++db) {
+                    int r = r0 + dr, g = g0 + dg, b = b0 + db;
+                    if (r < 0 || g < 0 || b < 0 || r > 15 || g > 15 ||
+                        b > 15)
+                        continue;
+                    sum += hist[(r << 8) | (g << 4) | b];
+                }
+        smooth[bin] = sum;
+    }
     int bestBin = -1;
     long bestCnt = 0;
     for (int pass = 0; pass < 3 && bestBin < 0; ++pass) {
@@ -256,7 +280,7 @@ Rect dominantSurfaceRect(const Image& img, std::vector<uint8_t>& surface,
             bool white = c.s < 0.10 && c.v > 0.93;
             bool dull = c.s < kPassS[pass];
             if (dark || white || dull) continue;
-            if (hist[bin] > bestCnt) { bestCnt = hist[bin]; bestBin = bin; }
+            if (smooth[bin] > bestCnt) { bestCnt = smooth[bin]; bestBin = bin; }
         }
     }
     // Match in HSV: shaded felts vary a lot in brightness (vignette) and get
@@ -604,6 +628,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 medOk = true;
             }
         }
+
         if (medOk) {
             // Windows: wide enough to hold a real gradient felt (8BP spans
             // s 0.43..0.88 / v 0.46..0.87 measured, including the darker
@@ -664,6 +689,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 // not leak into the surrounding page. Per-side fraction: a
                 // real gradient felt can recover a cut edge by ~10-14% of
                 // that side, while page leaks grow by 50-85%. Cap at 15%.
+
                 double growFrac = 0;
                 {
                     double gx = std::max(oldBest.x0 - best2.x0,
@@ -1108,6 +1134,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 if (std::hypot(c.cx - a.x, c.cy - a.y) < pocketExcl) { nearPocket = true; break; }
             if (nearPocket) continue;
             bool dup = false;
+
             for (const auto& k : kept) {
                 // 1.05 * ballR: same-ball duplicates from aim-line splits sit
                 // closer than this; real touching balls sit ~2 radii apart.

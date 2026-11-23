@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8 Ball Pool - mahmoudalabsi2003</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #14181f; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Live-test scene for pool-vision-trainer: mimics the 8 Ball Pool PC
+// client (title bar, red rails, gradient blue felt, numbered balls, cue
+// stick, aim line). Layout is RELATIVE to the window size so every
+// viewport renders the same scene — the analyzer must handle all of them.
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+
+function draw() {
+  cv.width = window.innerWidth; cv.height = window.innerHeight;
+  const W = cv.width, H = cv.height;
+
+  // dark client background
+  ctx.fillStyle = '#141a24';
+  ctx.fillRect(0, 0, W, H);
+
+  // title bar strip (10% height) like the real client
+  ctx.fillStyle = '#0d1118';
+  ctx.fillRect(0, 0, W, H * 0.095);
+  ctx.fillStyle = '#e8e8e8';
+  ctx.font = `${Math.round(H * 0.030)}px Arial`;
+  ctx.textBaseline = 'middle';
+  ctx.fillText('8 Ball Pool - mahmoudalabsi2003', W * 0.10, H * 0.048);
+
+  // table rect: centered, ~70% width (the real client's felt covers
+  // 68% of its window width), aspect 1.92:1
+  const tw = W * 0.70, th = Math.min(tw / 1.92, H * 0.80);
+  tw0 = (W - tw) / 2, th0 = H * 0.095 + (H * 0.905 - th) / 2;
+  const tx0 = tw0, ty0 = th0, tx1 = tw0 + tw, ty1 = th0 + th;
+
+  // red rails
+  ctx.fillStyle = '#8f2b21';
+  roundRect(tx0, ty0, tw, th, th * 0.045); ctx.fill();
+  // wood rail edge
+  ctx.strokeStyle = '#5d1d16';
+  ctx.lineWidth = Math.max(2, th * 0.008);
+  roundRect(tx0, ty0, tw, th, th * 0.045); ctx.stroke();
+
+  // gradient blue felt (hue 200, like the measured game)
+  const fx = tx0 + tw * 0.055, fy = ty0 + th * 0.075;
+  const fw = tw * 0.89, fh = th * 0.85;
+  // gradient inside the measured game windows (s 0.52-0.87, v 0.55-0.85)
+  const g = ctx.createLinearGradient(fx, fy, fx + fw, fy + fh);
+  g.addColorStop(0, '#468cb4');   // s .62 v .71
+  g.addColorStop(0.5, '#5aa9cd'); // s .56 v .80 bright mid band
+  g.addColorStop(1, '#2d6996');   // s .70 v .59
+  ctx.fillStyle = g;
+  ctx.fillRect(fx, fy, fw, fh);
+  // subtle center highlight (the bright mid band)
+  const rg = ctx.createRadialGradient(fx + fw * 0.5, fy + fh * 0.35, 10,
+                                      fx + fw * 0.5, fy + fh * 0.35, fw * 0.6);
+  rg.addColorStop(0, 'rgba(150,215,240,0.35)');
+  rg.addColorStop(1, 'rgba(120,190,220,0)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(fx, fy, fw, fh);
+
+  // six pockets (dark circles) at corners + mid top/bottom
+  const pr = th * 0.055;
+  const pock = [
+    [fx, fy], [fx + fw / 2, fy], [fx + fw, fy],
+    [fx, fy + fh], [fx + fw / 2, fy + fh], [fx + fw, fy + fh]];
+  for (const [px, py] of pock) {
+    ctx.fillStyle = '#0a0d12';
+    ctx.beginPath(); ctx.arc(px, py, pr, 0, 7); ctx.fill();
+  }
+
+  // balls: relative to the felt, r ~ fh*12/400 like the game scale
+  const r = fh * 12 / 400;
+  const balls = [
+    // cue ball
+    [0.28, 0.52, 'cue',    '#f5f5f2', '#f5f5f2', null],
+    // object balls scattered mid/right (like the user's frame)
+    [0.52, 0.38, 'solid',  '#c1272d', '#c1272d', '3'],
+    [0.62, 0.30, 'solid',  '#d9a520', '#d9a520', '1'],
+    [0.70, 0.42, 'solid',  '#1a8f3c', '#1a8f3c', '6'],
+    [0.58, 0.50, 'stripe', '#f5f5f2', '#1a8f3c', '14'],
+    [0.66, 0.58, 'solid',  '#111418', '#111418', '8'],
+    [0.75, 0.52, 'solid',  '#8e44ad', '#8e44ad', '4'],
+    [0.82, 0.38, 'solid',  '#d9a520', '#d9a520', '5'],
+    [0.86, 0.60, 'solid',  '#7b3f1d', '#7b3f1d', '7'],
+    [0.34, 0.72, 'solid',  '#8e44ad', '#8e44ad', '4'],
+    [0.55, 0.78, 'solid',  '#c1272d', '#c1272d', '3'],
+    [0.72, 0.75, 'stripe', '#f5f5f2', '#7b3f1d', '15'],
+  ];
+  const bx = u => fx + fw * u, by = v => fy + fh * v;
+
+  // aim line: from the cue ball toward ball 7 (top-right-ish)
+  const cue = balls[0];
+  const target = balls[8];                       // maroon 7 at .86,.60
+  const cx = bx(cue[0]), cy = by(cue[1]);
+  const gx = bx(target[0]), gy = by(target[1]);
+  const ang = Math.atan2(gy - cy, gx - cx);
+  ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+  ctx.lineWidth = Math.max(2, r * 0.18);
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.lineTo(gx - Math.cos(ang) * r * 1.4, gy - Math.sin(ang) * r * 1.4);
+  ctx.stroke();
+  // ghost ring at the contact point
+  ctx.beginPath();
+  ctx.arc(gx - Math.cos(ang) * r * 2, gy - Math.sin(ang) * r * 2, r, 0, 7);
+  ctx.stroke();
+
+  // cue stick: from the cue ball opposite the aim, wood with a tip
+  const stickLen = fw * 0.42;
+  const sx1 = cx - Math.cos(ang) * r * 2.2;
+  const sy1 = cy - Math.sin(ang) * r * 2.2;
+  const sx2 = sx1 - Math.cos(ang) * stickLen;
+  const sy2 = sy1 - Math.sin(ang) * stickLen;
+  const sg = ctx.createLinearGradient(sx1, sy1, sx2, sy2);
+  sg.addColorStop(0, '#d8c49a');  // light maple near the tip
+  sg.addColorStop(0.5, '#8a5a2b');
+  sg.addColorStop(1, '#3a2412');  // dark butt
+  ctx.strokeStyle = sg;
+  ctx.lineWidth = r * 0.55;
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(sx1, sy1); ctx.lineTo(sx2, sy2); ctx.stroke();
+  // tip + ferrule
+  ctx.strokeStyle = '#3b82c4';
+  ctx.lineWidth = r * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(sx1, sy1);
+  ctx.lineTo(sx1 - Math.cos(ang) * r * 0.7, sy1 - Math.sin(ang) * r * 0.7);
+  ctx.stroke();
+
+  // balls on top (so the aim line sits under the balls like the game)
+  for (const [u, v, kind, capCol, bodyCol, num] of balls) {
+    const x = bx(u), y = by(v);
+    ctx.save();
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.clip();
+    ctx.fillStyle = bodyCol;
+    ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+    if (kind === 'stripe') {
+      ctx.fillStyle = capCol;
+      ctx.fillRect(x - r, y - r, 2 * r, r * 0.9);
+      ctx.fillRect(x - r, y + r * 0.1, 2 * r, r * 0.9);
+    }
+    // shading for depth
+    const sh = ctx.createRadialGradient(x - r * 0.4, y - r * 0.4, r * 0.1,
+                                        x, y, r);
+    sh.addColorStop(0, 'rgba(255,255,255,0.35)');
+    sh.addColorStop(0.6, 'rgba(255,255,255,0)');
+    sh.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = sh;
+    ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+    ctx.restore();
+    // number disc
+    if (num) {
+      ctx.fillStyle = 'rgba(245,245,245,0.95)';
+      ctx.beginPath(); ctx.arc(x, y, r * 0.52, 0, 7); ctx.fill();
+      ctx.fillStyle = '#111';
+      ctx.font = `bold ${Math.round(r * 0.75)}px Arial`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(num, x, y + 0.5);
+    }
+  }
+  ctx.textAlign = 'left';
+}
+
+function roundRect(x, y, w, h, rr) {
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+window.addEventListener('resize', draw);
+draw();
+</script>
+</body>
+</html>

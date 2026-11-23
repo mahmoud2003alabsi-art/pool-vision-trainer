@@ -85,6 +85,12 @@ static bool g_lockValid = false;
 static pool::Rect g_lockRect{0, 0, 0, 0};
 static int g_lockW = 0, g_lockH = 0, g_lockFail = 0;
 
+// Consecutive bad detections on the bound window. A window that keeps
+// producing implausible tables (e.g. the overlay bound to a browser
+// page ABOUT the game) is the WRONG window: after several failures the
+// binding is released so the probe can pick the real game window.
+static int g_badFrames = 0;
+
 // Memory double buffer: the whole frame is composed off-screen and blitted
 // once per tick. Drawing straight onto the color-key layered window with
 // several GetDC/ReleaseDC passes makes every intermediate state visible —
@@ -207,7 +213,10 @@ void applyIni(Args& a, const std::wstring& path) {
     if (strVal("feltTolS")) a.feltTolS = numVal("feltTolS");
     if (strVal("feltTolV")) a.feltTolV = numVal("feltTolV");
     if (strVal("stripLines")) a.stripLines = numVal("stripLines") != 0;
-    if (strVal("manualRect")) a.manualRect = numVal("manualRect") != 0;
+    // Manual rect is a live-tuning aid: never restore it ON across
+    // sessions — a rect marked on the previous screen would force itself
+    // onto the new one and misalign every guide.
+    (void)strVal("manualRect");
     if (strVal("rectX0")) a.rectX0 = numVal("rectX0");
     if (strVal("rectY0")) a.rectY0 = numVal("rectY0");
     if (strVal("rectX1")) a.rectX1 = numVal("rectX1");
@@ -453,14 +462,23 @@ static void scanWindows() {
     for (size_t i = 0; i < g_scanTitles.size(); ++i) {
         std::wstring lt = lower(g_scanTitles[i]);
         int score = 0;
-        if (lt.find(L"pool") != std::wstring::npos ||
-            lt.find(L"billiard") != std::wstring::npos ||
-            lt.find(L"billar") != std::wstring::npos ||
-            lt.find(L"biliar") != std::wstring::npos ||
-            lt.find(L"8 ball") != std::wstring::npos ||
-            lt.find(L"snooker") != std::wstring::npos ||
-            lt.find(L"بليارد") != std::wstring::npos)
-            score = 8;
+        // The real 8BP client window is titled "8 Ball Pool - <user>".
+        // A browser tab whose PAGE TITLE merely mentions the game (a
+        // Google search for "8 ball pool" used to score the same and,
+        // enumerating first, won the probe — the overlay then bound to
+        // Chrome and drew guides over the address bar). The exact client
+        // prefix outranks generic keyword containment.
+        if (lt.rfind(L"8 ball pool - ", 0) == 0 ||
+            lt.rfind(L"8 ball pool-", 0) == 0)
+            score = 10;
+        else if (lt.find(L"pool") != std::wstring::npos ||
+                 lt.find(L"billiard") != std::wstring::npos ||
+                 lt.find(L"billar") != std::wstring::npos ||
+                 lt.find(L"biliar") != std::wstring::npos ||
+                 lt.find(L"8 ball") != std::wstring::npos ||
+                 lt.find(L"snooker") != std::wstring::npos ||
+                 lt.find(L"بليارد") != std::wstring::npos)
+            score = 6;
         else if (lt.find(L"game") != std::wstring::npos ||
                  lt.find(L"لعبة") != std::wstring::npos)
             score = 3;
@@ -482,7 +500,15 @@ bool probeWindow(HWND h) {
     if (cap.w < 220 || cap.h < 130) return false;
     pool::TableSpec t = pool::TableSpec::standard();
     try {
-        pool::detectBalls(cap, {}, t);  // throws when no plausible table
+        pool::DetectResult det = pool::detectBalls(cap, {}, t);
+        // A live game frame holds many balls and the felt fills most of
+        // the window. A browser window showing a page ABOUT the game
+        // (search results with the game inset in a screenshot) used to
+        // pass with a small inset felt — reject both shapes.
+        double capArea = static_cast<double>(cap.w) * cap.h;
+        double feltFrac = (det.feltRect.w() * det.feltRect.h()) / capArea;
+        if (det.balls.size() < 3) return false;
+        if (feltFrac < 0.30) return false;
         return true;
     } catch (...) {
         return false;
@@ -1178,7 +1204,18 @@ void drawSimPreview(const pool::DetectResult& det, const std::vector<pool::Ball>
 }  // namespace
 
 int main() {
-    SetProcessDPIAware();  // physical pixels everywhere (DPI-safe capture)
+    // Per-monitor v2: physical pixels on EVERY monitor. Plain
+    // SetProcessDPIAware is system-aware — when the game window moves to
+    // a monitor with a different scale factor the coordinates get
+    // virtualized and the guides draw shifted off the table.
+    if (auto ctx = reinterpret_cast<decltype(&SetProcessDpiAwarenessContext)>(
+            static_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll")),
+                                   "SetProcessDpiAwarenessContext"))) {
+        if (!ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+            SetProcessDPIAware();
+    } else {
+        SetProcessDPIAware();
+    }
     g_logPath = iniPath();
     g_args = parseArgs();
     if (!g_args.window.empty() && g_args.window.size() > 200) g_args.window.resize(200);
@@ -1409,6 +1446,26 @@ int main() {
                         for (const auto& b : det.balls)
                             if (b.kind == "cue") hasCue = true;
                         bool good = hasCue && det.balls.size() >= 2;
+                        // Wrong-window gate: a real game frame has the felt
+                        // covering a large fraction of its window. A browser
+                        // page about the game yields a small inset felt —
+                        // treat it as a failed detection and, after 10 in a
+                        // row, drop the binding so the probe re-picks.
+                        double capArea =
+                            static_cast<double>(cap.w) * cap.h;
+                        double feltFrac =
+                            (det.feltRect.w() * det.feltRect.h()) / capArea;
+                        if (good && feltFrac < 0.30) good = false;
+                        if (!good && ++g_badFrames >= 10) {
+                            g_badFrames = 0;
+                            if (g_game) {
+                                LOGF("[bind] release window: implausible "
+                                     "table for 10 frames");
+                                g_game = nullptr;
+                            }
+                        } else if (good) {
+                            g_badFrames = 0;
+                        }
                         if (good && !g_args.manualRect) {
                             if (!g_lockValid) {
                                 g_lockRect = det.feltRect;
@@ -1667,6 +1724,14 @@ int main() {
                              static_cast<int>(shots.size()),
                              shots.empty() ? "-" : shots[0].typeName.c_str());
                 } catch (const std::exception& e) {
+                    if (++g_badFrames >= 10) {
+                        g_badFrames = 0;
+                        if (g_game) {
+                            LOGF("[bind] release window: detection keeps "
+                                 "failing");
+                            g_game = nullptr;
+                        }
+                    }
                     if (frame % 24 == 0) LOGF("[--] %s", e.what());
                     int wl = MultiByteToWideChar(CP_UTF8, 0, e.what(), -1,
                                                  nullptr, 0);

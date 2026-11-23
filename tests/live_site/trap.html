@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>طريقة عمل السيرفر على بلياردو 8 Ball Pool + يمكلا - بحث Google</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #202124; color: #e8eaed;
+               font-family: Arial, sans-serif; overflow: hidden; }
+  .bar { height: 8%; background: #35363a; display: flex; align-items: center;
+         padding: 0 18px; font-size: 14px; color: #bdc1c6; }
+  .content { padding: 24px 40px; display: flex; gap: 30px; }
+  .text { max-width: 46%; line-height: 1.9; font-size: 17px; }
+  .inset { flex: 1; display: flex; align-items: center; justify-content: center; }
+  canvas { border: 1px solid #555; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+</style>
+</head>
+<body>
+<div class="bar">google.com/search?q=طريقة+عمل+السيرفر+على+بلياردو+8+Ball+Pool</div>
+<div class="content">
+  <div class="text">
+    <h2>نعم، يمكنك ألّا تقف عند السيرفر، لكن ليس X</h2>
+    <p>إليك الطريقة المضمونة عبر إضافات CS1.6 وطرق أخرى يمكن استخدامها:
+       يدع التسحير، إيقاف التسحير، طريقة عمل الديوية، وعندما تظل و...</p>
+  </div>
+  <div class="inset"><canvas id="c" width="480" height="300"></canvas></div>
+</div>
+<script>
+// A SMALL INSET of the game (like a screenshot inside a page). The
+// whole capture is a browser window: the felt covers well under 30%
+// of it, which the hardened probe now rejects.
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+ctx.fillStyle = '#141a24'; ctx.fillRect(0, 0, W, H);
+ctx.fillStyle = '#0d1118'; ctx.fillRect(0, 0, W, H * 0.1);
+const tw = W * 0.64, th = Math.min(tw / 1.92, H * 0.78);
+const tx0 = (W - tw) / 2, ty0 = H * 0.1 + (H * 0.9 - th) / 2;
+ctx.fillStyle = '#8f2b21';
+ctx.beginPath();
+ctx.roundRect ? ctx.roundRect(tx0, ty0, tw, th, th * 0.045)
+              : ctx.rect(tx0, ty0, tw, th);
+ctx.fill();
+const fx = tx0 + tw * 0.055, fy = ty0 + th * 0.075;
+const fw = tw * 0.89, fh = th * 0.85;
+const g = ctx.createLinearGradient(fx, fy, fx + fw, fy + fh);
+g.addColorStop(0, '#3e7fa8'); g.addColorStop(1, '#1f587f');
+ctx.fillStyle = g; ctx.fillRect(fx, fy, fw, fh);
+const r = fh * 12 / 400;
+const balls = [[0.28,0.52,'#f5f5f2'], [0.52,0.38,'#c1272d'],
+               [0.62,0.30,'#d9a520'], [0.70,0.42,'#1a8f3c'],
+               [0.66,0.58,'#111418'], [0.75,0.52,'#8e44ad']];
+for (const [u, v, col] of balls) {
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.arc(fx + fw * u, fy + fh * v, r, 0, 7);
+  ctx.fill();
+}
+</script>
+</body>
+</html>
