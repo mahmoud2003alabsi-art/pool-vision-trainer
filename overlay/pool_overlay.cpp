@@ -1213,12 +1213,13 @@ int main() {
     {
         using Ctx = void*;                       // DPI_AWARENESS_CONTEXT
         using SetCtxFn = BOOL(WINAPI*)(Ctx);
-        Ctx kCtxPerMonitorV2 = static_cast<Ctx>(static_cast<void*>(
-            static_cast<intptr_t>(-4)));         // ..._PER_MONITOR_AWARE_V2
-        SetCtxFn setCtx = reinterpret_cast<SetCtxFn>(
-            static_cast<void*>(GetProcAddress(
-                GetModuleHandleW(L"user32.dll"),
-                "SetProcessDpiAwarenessContext")));
+        // C casts: MinGW forbids static_cast between integer/pointer and
+        // FARPROC, and the FARPROC->function-pointer cast is the classic
+        // GetProcAddress idiom.
+        Ctx kCtxPerMonitorV2 = (Ctx)(void*)(intptr_t)(-4);  // PER_MONITOR_V2
+        SetCtxFn setCtx = (SetCtxFn)(void*)GetProcAddress(
+            GetModuleHandleW(L"user32.dll"),
+            "SetProcessDpiAwarenessContext");
         if (setCtx && setCtx(kCtxPerMonitorV2)) {
             // per-monitor v2 active
         } else {
