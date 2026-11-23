@@ -197,6 +197,72 @@ int main() {
         }
     }
 
+    // 4. Flipped stripe ball (white cap facing up) must NOT be classified
+    //    as the cue: its colored stripe colors the rim ring. The real
+    //    white ball must win the cue vote even when the stripe is more
+    //    isolated.
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        // Real cue ball: white all the way to the edge.
+        double cueX = 200 + 130 * sx, cueY = 120 + 225 * sy;
+        disc(px, W, cueX, cueY, 13, 250, 250, 250);
+        // Flipped stripe: colored disc with a white cap (pole up).
+        double stX = 200 + 560 * sx, stY = 120 + 110 * sy;
+        disc(px, W, stX, stY, 13, 235, 200, 40);       // yellow stripe body
+        disc(px, W, stX, stY, 13 * 0.60, 252, 250, 246);  // white cap on top
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        CHECK(det.balls.size() >= 2);
+        int cueIdx = -1;
+        for (size_t i = 0; i < det.balls.size(); ++i)
+            if (det.balls[i].kind == "cue") cueIdx = static_cast<int>(i);
+        CHECK(cueIdx >= 0);
+        if (cueIdx >= 0) {
+            Vec2 p = det.balls[static_cast<size_t>(cueIdx)].px;
+            CHECK_NEAR(p.x, cueX, 10.0);   // cue = the real white ball...
+            CHECK_NEAR(p.y, cueY, 10.0);   // ...not the flipped stripe
+        }
+        bool flippedBecameCue = false;
+        for (size_t i = 0; i < det.balls.size(); ++i) {
+            const auto& d = det.balls[i];
+            if (std::hypot(d.px.x - stX, d.px.y - stY) < 15.0 &&
+                d.kind == "cue")
+                flippedBecameCue = true;
+        }
+        CHECK(!flippedBecameCue);
+    }
+
+    // 5. A flipped stripe alone on the table: nothing may be classified
+    //    as the cue ball (it used to become the cue all by itself).
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        double stX = 200 + 350 * sx, stY = 120 + 200 * sy;
+        disc(px, W, stX, stY, 13, 235, 200, 40);
+        disc(px, W, stX, stY, 13 * 0.60, 252, 250, 246);
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        CHECK(det.balls.size() >= 1);
+        for (const auto& d : det.balls) CHECK(d.kind != "cue");
+    }
+
     if (gFail == 0) {
         std::printf("ALL VISION TESTS PASSED\n");
         return 0;

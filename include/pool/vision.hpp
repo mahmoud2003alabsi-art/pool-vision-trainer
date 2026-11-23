@@ -46,6 +46,8 @@ struct Detection {
     std::string color;
     int number = -1;  // 0 = cue, 8 = black, else best color guess (1-7 / 9-15)
     double whiteRatio = 0, sat = 0, val = 0, hue = 0;
+    double rimColored = 0;  // colored fraction of the 0.68R..0.95R ring:
+                            // high for a stripe ball showing its white cap
     double area = 0;
 };
 

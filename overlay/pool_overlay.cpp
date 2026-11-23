@@ -19,6 +19,7 @@
 #include <shellapi.h>
 #include "pool/vision.hpp"
 #include "pool/solver.hpp"
+#include "pool/stabilize.hpp"
 #include "pool/physics.hpp"
 #include <algorithm>
 #include <map>
@@ -63,6 +64,59 @@ struct Args {
 Args g_args;
 HWND g_ov = nullptr;
 bool g_visible = true;
+bool g_menuHidden = false;  // Insert: hide panel + HUD, keep only the guides
+
+// Temporal stabilization state (anti-jitter).
+static pool::BallStabilizer g_ballStab;
+static pool::Rect g_stabRect;
+static pool::Quad g_stabQuad;
+static double g_stabRPx = 0;
+static bool g_stabHasQuad = false, g_stabValid = false;
+static HWND g_stabGame = nullptr;
+
+// Memory double buffer: the whole frame is composed off-screen and blitted
+// once per tick. Drawing straight onto the color-key layered window with
+// several GetDC/ReleaseDC passes makes every intermediate state visible —
+// the overlay would flicker nonstop.
+static HDC g_memDC = nullptr;
+static HBITMAP g_memBmp = nullptr, g_memOldBmp = nullptr;
+static int g_memW = 0, g_memH = 0;
+
+void fillKey(HDC dc, const RECT& rc);  // defined below (forward decl)
+
+static HDC beginFrame(const RECT& rc) {
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return nullptr;
+    if (!g_memDC) {
+        g_memDC = CreateCompatibleDC(nullptr);
+        if (!g_memDC) return nullptr;
+    }
+    if (g_memW != w || g_memH != h) {
+        if (g_memBmp) {
+            SelectObject(g_memDC, g_memOldBmp);
+            DeleteObject(g_memBmp);
+            g_memBmp = nullptr;
+        }
+        HDC wdc = GetDC(g_ov);
+        g_memBmp = CreateCompatibleBitmap(wdc, w, h);
+        ReleaseDC(g_ov, wdc);
+        if (!g_memBmp) return nullptr;
+        g_memOldBmp = static_cast<HBITMAP>(
+            SelectObject(g_memDC, g_memBmp));
+        g_memW = w;
+        g_memH = h;
+    }
+    fillKey(g_memDC, rc);
+    return g_memDC;
+}
+
+static void presentFrame(const RECT& rc) {
+    if (!g_memDC || !g_ov) return;
+    HDC wdc = GetDC(g_ov);
+    BitBlt(wdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+           g_memDC, 0, 0, SRCCOPY);
+    ReleaseDC(g_ov, wdc);
+}
 
 void printUsage() {
     std::printf(
@@ -813,9 +867,8 @@ void clearOverlay() {
     if (!g_ov) return;
     RECT rc;
     GetClientRect(g_ov, &rc);
-    HDC dc = GetDC(g_ov);
-    fillKey(dc, rc);
-    ReleaseDC(g_ov, dc);
+    HDC dc = beginFrame(rc);
+    if (dc) presentFrame(rc);
 }
 
 // Draw the best shots' guides in client pixel coordinates. The overlay is
@@ -848,12 +901,8 @@ static void drawArrow(HDC dc, POINT a, POINT b, COLORREF col, int wdt) {
 // All mapping goes through the perspective quad when the felt was fitted as
 // a trapezoid, so lines land on the drawn table.
 void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& shots,
-                int topN) {
-    if (!g_ov) return;
-    RECT rc;
-    GetClientRect(g_ov, &rc);
-    HDC dc = GetDC(g_ov);
-    fillKey(dc, rc);
+                int topN, HDC dc) {
+    if (!g_ov || !dc) return;
 
     pool::Rect f = det.feltRect;  // same +/-2 shrink detection mapped with
     f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
@@ -1025,11 +1074,9 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
 
 std::wstring g_status;  // one-line HUD text, updated by the analysis loop
 
-void drawHud() {
-    if (!g_ov || !g_visible || g_status.empty()) return;
-    HDC dc = GetDC(g_ov);
-    RECT rc;
-    GetClientRect(g_ov, &rc);
+void drawHud(HDC dc, const RECT& crc) {
+    if (!g_visible || g_status.empty() || !dc) return;
+    RECT rc = crc;
     rc.bottom = rc.top + 22;
     RECT bg = {0, 0, rc.right, rc.bottom};
     HBRUSH br = CreateSolidBrush(RGB(0, 0, 0));
@@ -1039,19 +1086,14 @@ void drawHud() {
     SetTextColor(dc, RGB(255, 255, 120));
     DrawTextW(dc, g_status.c_str(), -1, &rc,
               DT_SINGLELINE | DT_LEFT | DT_VCENTER);
-    ReleaseDC(g_ov, dc);
 }
 
 // Live simulation preview: the game's own aim guideline was detected, so show
 // what the CURRENT aim will do — every ball's predicted path, the rest
 // positions and a pocket flash (yellow = object potted, red = scratch).
 void drawSimPreview(const pool::DetectResult& det, const std::vector<pool::Ball>& balls,
-                    const pool::SimResult& sim, pool::Vec2 dirPx) {
-    if (!g_ov) return;
-    RECT rc;
-    GetClientRect(g_ov, &rc);
-    HDC dc = GetDC(g_ov);
-    fillKey(dc, rc);
+                    const pool::SimResult& sim, pool::Vec2 dirPx, HDC dc) {
+    if (!g_ov || !dc) return;
     if (g_visible && !sim.final.empty() && balls.size() == sim.final.size()) {
         pool::Rect f = det.feltRect;  // same +/-2 shrink detection mapped with
         f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
@@ -1192,7 +1234,7 @@ int main() {
             // panel (sticky while dragging): the game keeps its input.
             bool sticky = g_menu.draggingPanel || g_menu.dragSlider;
             bool overPanel = false;
-            if (g_menu.open && !g_tabs.empty()) {
+            if (g_menu.open && !g_menuHidden && !g_tabs.empty()) {
                 mui::Rect pr = mui::panelRect(
                     g_m, g_menu, g_tabs[static_cast<size_t>(g_menu.activeTab)]);
                 overPanel = pr.contains(mx - 4, my - 4) ||
@@ -1203,7 +1245,7 @@ int main() {
                             ? (ex & ~WS_EX_TRANSPARENT)
                             : (ex | WS_EX_TRANSPARENT);
             if (want != ex) SetWindowLongW(g_ov, GWL_EXSTYLE, want);
-            if (down && !prevDown) {
+            if (down && !prevDown && !g_menuHidden) {
                 mui::HitResult hr = mui::hitTest(g_m, g_menu, g_tabs, mx, my);
                 if (mui::press(g_m, g_menu, g_tabs, mx, my) &&
                     hr.hit == mui::H_Ctrl && hr.ctrl >= 0 &&
@@ -1272,6 +1314,16 @@ int main() {
                         g_args.stripLines ? 1 : 0, g_args.manualRect ? 1 : 0,
                         g_args.rectX0, g_args.rectY0, g_args.rectX1, g_args.rectY1);
         }
+        if (GetAsyncKeyState(VK_INSERT) & 1) {
+            g_menuHidden = !g_menuHidden;
+            std::printf("[i] UI %s (Insert)\n",
+                        g_menuHidden ? "hidden" : "shown");
+        }
+        if (GetAsyncKeyState('X') & 1) {
+            std::printf("[x] exit (X pressed)\n");
+            saveIni();
+            g_running = false;
+        }
 
         if (!g_game || !IsWindow(g_game) || IsIconic(g_game)) {
             g_game = nullptr;
@@ -1281,14 +1333,33 @@ int main() {
                 g_game = findGameWindowAuto();  // one capture probe per tick
             }
         }
+        // Compose the entire frame in memory, present once (no flicker).
+        RECT orc{};
+        HDC fdc = nullptr;
+        if (g_ov) {
+            GetClientRect(g_ov, &orc);
+            fdc = beginFrame(orc);
+        }
         HWND game = g_game;
         if (game) {
             RECT rc;
             GetClientRect(game, &rc);
             POINT pt{};
             ClientToScreen(game, &pt);
-            SetWindowPos(g_ov, HWND_TOPMOST, pt.x, pt.y, rc.right - rc.left,
-                         rc.bottom - rc.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // Reposition only when the game rect really changed: a per-frame
+            // SetWindowPos churns the DWM and reads as shaking.
+            static RECT s_tgt = {};
+            static bool s_tgtValid = false;
+            RECT tgt = {pt.x, pt.y, pt.x + (rc.right - rc.left),
+                        pt.y + (rc.bottom - rc.top)};
+            if (!s_tgtValid || tgt.left != s_tgt.left || tgt.top != s_tgt.top ||
+                tgt.right != s_tgt.right || tgt.bottom != s_tgt.bottom) {
+                SetWindowPos(g_ov, HWND_TOPMOST, tgt.left, tgt.top,
+                             tgt.right - tgt.left, tgt.bottom - tgt.top,
+                             SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                s_tgt = tgt;
+                s_tgtValid = true;
+            }
 
             pool::Image cap;
             bool analyzed = false;
@@ -1305,6 +1376,34 @@ int main() {
                             g_args.rectX0 * cap.w, g_args.rectY0 * cap.h,
                             g_args.rectX1 * cap.w, g_args.rectY1 * cap.h};
                     pool::DetectResult det = pool::detectBalls(cap, dopt, g_tbl);
+
+                    // Temporal stabilization: glide the felt geometry and the
+                    // ball positions so the guides stop trembling between
+                    // frames. Real moves snap instantly (smooth* helpers).
+                    if (game != g_stabGame) {
+                        g_stabGame = game;
+                        g_stabValid = false;
+                        g_stabHasQuad = false;
+                        g_stabRPx = 0;
+                        g_ballStab.reset();
+                    }
+                    if (g_stabValid) {
+                        det.feltRect = pool::smoothRect(g_stabRect, det.feltRect,
+                                                        0.45, 0.03);
+                        if (det.hasQuad && g_stabHasQuad)
+                            det.quadPx = pool::smoothQuad(g_stabQuad, det.quadPx,
+                                                          0.45, 0.03);
+                        det.ballRPx = pool::smoothScalar(g_stabRPx, det.ballRPx,
+                                                         0.30);
+                    }
+                    g_stabRect = det.feltRect;
+                    if (det.hasQuad) {
+                        g_stabQuad = det.quadPx;
+                        g_stabHasQuad = true;
+                    }
+                    g_stabRPx = det.ballRPx;
+                    g_stabValid = true;
+                    g_ballStab.apply(det.balls, det.ballRPx);
                     std::vector<pool::Ball> balls;
                     int cueIdx = -1;
                     for (size_t i = 0; i < det.balls.size(); ++i) {
@@ -1363,7 +1462,7 @@ int main() {
                                 det.table, balls,
                                 dirL * (pool::PhysicsParams{}.maxShotSpeed * power),
                                 0, 0);
-                            drawSimPreview(det, balls, sim, dirPx);
+                            drawSimPreview(det, balls, sim, dirPx, fdc);
                             aimPotted = static_cast<int>(sim.potted.size());
                             aimScratch = sim.cueScratch;
                             drewSim = true;
@@ -1383,7 +1482,7 @@ int main() {
                         shots = solver.allShots();
                     }
                     if (!drewSim && g_visible)
-                        drawGuides(det, shots, g_args.shots);
+                        drawGuides(det, shots, g_args.shots, fdc);
                     {
                         wchar_t buf[160];
                         _snwprintf(buf, 160,
@@ -1399,7 +1498,7 @@ int main() {
                                    g_args.manualRect ? L" [MAN]" : L"");
                         g_status = buf;
                     }
-                    if (!g_menu.open) drawHud();
+                    if (!g_menu.open && !g_menuHidden) drawHud(fdc, orc);
                     analyzed = true;
                     if (frame % 24 == 0)
                         LOGF("[ok] balls=%d shots=%d best=%s",
@@ -1415,12 +1514,12 @@ int main() {
                         MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, w.data(), wl);
                         g_status = L"[!] " + w;
                     }
-                    if (!g_menu.open) drawHud();
+                    if (!g_menu.open && !g_menuHidden) drawHud(fdc, orc);
                 }
             }
-            if (!analyzed) clearOverlay();
         } else {
-            clearOverlay();
+            g_status = L"waiting for the game window...";
+            if (!g_menu.open && !g_menuHidden) drawHud(fdc, orc);
             if (frame % 60 == 0) {
                 char wbuf[512] = {};
                 WideCharToMultiByte(
@@ -1432,14 +1531,16 @@ int main() {
             }
         }
         // menu last so it draws above the guides
-        {
-            HDC dc = GetDC(g_ov);
-            drawMenu(dc);
-            ReleaseDC(g_ov, dc);
-        }
+        if (fdc && g_menu.open && !g_menuHidden) drawMenu(fdc);
+        if (fdc) presentFrame(orc);
         ++frame;
         Sleep(1000 / g_args.fps);
     }
+    if (g_memBmp) {
+        SelectObject(g_memDC, g_memOldBmp);
+        DeleteObject(g_memBmp);
+    }
+    if (g_memDC) DeleteDC(g_memDC);
     LOGF("bye");
     return 0;
 }

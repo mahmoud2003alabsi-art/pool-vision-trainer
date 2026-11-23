@@ -833,7 +833,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         const auto& b = raw.b;
         double r = std::sqrt(b.area / 3.14159265358979323846);
         double ir = std::max(1.0, r * 0.85);  // sampling radius inside the disc
-        long whiteCnt = 0, blackCnt = 0, colCnt = 0;
+        long whiteCnt = 0, blackCnt = 0, colCnt = 0, rimTot = 0, rimCol = 0;
         double sumS = 0, sumV = 0, sumColV = 0;
         int hist[24] = {0};
         long total = 0;
@@ -848,7 +848,8 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             for (int x = x0; x <= x1; ++x) {
                 if (x < 0 || y < 0 || x >= w || y >= h) continue;
                 double dx = x - b.cx, dy = y - b.cy;
-                if (dx * dx + dy * dy > ir * ir) continue;
+                double d2 = dx * dx + dy * dy;
+                if (d2 > ir * ir) continue;
                 size_t i = static_cast<size_t>(y) * w + x;
                 Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
                 ++total;
@@ -858,6 +859,14 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 bool black = c.v < opt.blackValMax;
                 if (white) ++whiteCnt;
                 if (black) ++blackCnt;
+                // Rim ring 0.68R..0.95R: white for a real cue ball, colored
+                // for a stripe ball flipped white-cap-up (the stripe wraps
+                // the silhouette edge around the cap).
+                double rimLo = ir * ir * 0.46, rimHi = ir * ir * 0.90;
+                if (d2 >= rimLo && d2 <= rimHi) {
+                    ++rimTot;
+                    if (c.s > 0.30 && c.v > 0.20) ++rimCol;
+                }
                 if (c.s > 0.30 && c.v > 0.20) {
                     ++colCnt;
                     sumColV += c.v;
@@ -887,6 +896,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         d.area = static_cast<double>(b.area);
         d.whiteRatio = static_cast<double>(whiteCnt) / total;
         double centerWhite = ctot > 0 ? static_cast<double>(cwhite) / ctot : 0.0;
+        d.rimColored = rimTot > 0 ? static_cast<double>(rimCol) / rimTot : 0.0;
         d.sat = sumS / total;
         d.val = sumV / total;
         int hueBin = static_cast<int>(std::max_element(hist, hist + 24) - hist);
@@ -896,10 +906,14 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
 
         if (blackRatio > 0.55) {
             d.kind = "black"; d.color = "black"; d.number = 8;
-        } else if (d.whiteRatio > 0.80 || centerWhite > 0.72) {
+        } else if ((d.whiteRatio > 0.80 || centerWhite > 0.72) &&
+                   d.rimColored < 0.25) {
             // 0.72 center gate: the ball center is white for a real cue
             // ball even when a salvaged/merged blob sits a few px off, and
-            // colored for stripe/solid balls (their band crosses the center).
+            // colored for stripe/solid balls (their band crosses the
+            // center). The rim gate rejects a stripe ball flipped
+            // white-cap-up: its cap looks like a cue disc but the stripe
+            // colors the silhouette edge, which a real cue never does.
             d.kind = "cue"; d.color = "white"; d.number = 0;
         } else if (d.whiteRatio > opt.stripeWhiteMin) {
             d.kind = "stripe";
@@ -1019,6 +1033,42 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                         if (c.s < 0.30 && c.v > 0.62) ++wCnt;
                     }
                 }
+                // Rim guard for the fallback too: a deep white core can
+                // be a stripe ball's cap; a colored rim means it is not the
+                // cue. Erase the cap disc and probe the next white region.
+                {
+                    long rimT = 0, rimC = 0;
+                    double rr0 = ballR * ballR * 0.46, rr1 = ballR * ballR * 0.90;
+                    int ax0 = static_cast<int>(bestC.x - ballR),
+                        ax1 = static_cast<int>(bestC.x + ballR);
+                    int ay0 = static_cast<int>(bestC.y - ballR),
+                        ay1 = static_cast<int>(bestC.y + ballR);
+                    for (int yy = ay0; yy <= ay1; ++yy)
+                        for (int xx = ax0; xx <= ax1; ++xx) {
+                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                            double ddx = xx - bestC.x, ddy = yy - bestC.y;
+                            double dd2 = ddx * ddx + ddy * ddy;
+                            if (dd2 < rr0 || dd2 > rr1) continue;
+                            size_t ri = static_cast<size_t>(yy) * w + xx;
+                            Hsv c = rgbToHsv(img.px[ri * 3], img.px[ri * 3 + 1],
+                                             img.px[ri * 3 + 2]);
+                            ++rimT;
+                            if (c.s > 0.30 && c.v > 0.20) ++rimC;
+                        }
+                    if (rimT > 0 && rimC >= rimT * 0.25) {
+                        int ix = static_cast<int>(bestC.x),
+                            iy = static_cast<int>(bestC.y);
+                        int ir2 = static_cast<int>(ballR) + 2;
+                        for (int yy = iy - ir2; yy <= iy + ir2; ++yy)
+                            for (int xx = ix - ir2; xx <= ix + ir2; ++xx) {
+                                if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                                double ddx = xx - bestC.x, ddy = yy - bestC.y;
+                                if (ddx * ddx + ddy * ddy <= ir2 * ir2)
+                                    wm[static_cast<size_t>(yy) * w + xx] = 0;
+                            }
+                        continue;  // probe the next-deepest white region
+                    }
+                }
                 if (tot > 0 && wCnt >= tot * 0.40) {
                     Detection d;
                     d.px = bestC;
@@ -1061,9 +1111,11 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         double bestIso = -1;
         for (int i = 0; i < n; ++i) {
             const auto& d = res.balls[i];
-            bool whiteish =
-                d.kind == "cue" || d.kind == "unknown" ||
-                d.whiteRatio > 0.45;
+            // Rim gate again: a white-cap stripe must never win the cue
+            // isolation vote even when it is the most isolated white ball.
+            bool whiteish = d.rimColored < 0.25 &&
+                            (d.kind == "cue" || d.kind == "unknown" ||
+                             d.whiteRatio > 0.45);
             if (!whiteish) continue;
             double iso = nnDist(i);
             if (iso > bestIso) {
