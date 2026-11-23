@@ -1207,14 +1207,23 @@ int main() {
     // Per-monitor v2: physical pixels on EVERY monitor. Plain
     // SetProcessDPIAware is system-aware — when the game window moves to
     // a monitor with a different scale factor the coordinates get
-    // virtualized and the guides draw shifted off the table.
-    if (auto ctx = reinterpret_cast<decltype(&SetProcessDpiAwarenessContext)>(
-            static_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll")),
-                                   "SetProcessDpiAwarenessContext"))) {
-        if (!ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+    // virtualized and the guides draw shifted off the table. Resolved
+    // dynamically with explicit types: older MinGW headers lack
+    // DPI_AWARENESS_CONTEXT and the function declaration.
+    {
+        using Ctx = void*;                       // DPI_AWARENESS_CONTEXT
+        using SetCtxFn = BOOL(WINAPI*)(Ctx);
+        Ctx kCtxPerMonitorV2 = static_cast<Ctx>(static_cast<void*>(
+            static_cast<intptr_t>(-4)));         // ..._PER_MONITOR_AWARE_V2
+        SetCtxFn setCtx = reinterpret_cast<SetCtxFn>(
+            static_cast<void*>(GetProcAddress(
+                GetModuleHandleW(L"user32.dll"),
+                "SetProcessDpiAwarenessContext")));
+        if (setCtx && setCtx(kCtxPerMonitorV2)) {
+            // per-monitor v2 active
+        } else {
             SetProcessDPIAware();
-    } else {
-        SetProcessDPIAware();
+        }
     }
     g_logPath = iniPath();
     g_args = parseArgs();
