@@ -303,6 +303,60 @@ int main() {
         }
     }
 
+    // 7. Locked boundary (forceRect) on a gradient felt: with the rect
+    //    fixed, the far-end balls that a collapsing fit used to lose are
+    //    always found, and the felt rect equals the forced rect exactly.
+    {
+        const int W = 1000, H = 640;
+        TableSpec tbl = TableSpec::standard();
+        // blue gradient felt like 8BP: saturation 0.45 at the left end,
+        // 0.85 at the right end, brightness drifting too
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x) {
+                double t = (x - 200) / 700.0;
+                // hue ~200, s 0.45..0.85, v 0.62..0.5
+                double s2 = 0.45 + 0.40 * t, v2 = 0.62 - 0.12 * t;
+                // inline HSV(200deg) -> RGB
+                double c = v2 * s2, xx = c * (1 - std::fabs(
+                    std::fmod(200.0 / 60.0, 2.0) - 1)), m = v2 - c;
+                double rr = m, gg = m, bb = m;  // sector 3: g+b... compute
+                double hp = 200.0 / 60.0;      // 3.33 -> (0,c,x)+m
+                double seg = hp - 3;           // 0.33
+                rr = m; gg = c; bb = xx;
+                (void)seg;
+                put(px, W, x, y, static_cast<int>(rr * 255),
+                    static_cast<int>(gg * 255), static_cast<int>(bb * 255));
+            }
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        // two balls at the DARK far end + cue at the lit end
+        disc(px, W, 200 + 660 * sx, 120 + 150 * sy, 13, 130, 88, 165);
+        disc(px, W, 200 + 680 * sx, 120 + 300 * sy, 13, 120, 45, 28);
+        disc(px, W, 200 + 120 * sx, 120 + 250 * sy, 13, 250, 250, 250);
+        Image img = makeImage(W, H, px);
+        Rect forced{200, 120, 900, 520};
+        DetectOptions opt;
+        opt.forceRect = forced;
+        DetectResult det = detectBalls(img, opt, tbl);
+        bool rectOk = std::fabs(det.feltRect.x0 - forced.x0) < 2 &&
+                      std::fabs(det.feltRect.x1 - forced.x1) < 2 &&
+                      std::fabs(det.feltRect.y0 - forced.y0) < 2 &&
+                      std::fabs(det.feltRect.y1 - forced.y1) < 2;
+        CHECK(rectOk);
+        int cueCount = 0, purple = 0, maroon = 0;
+        for (const auto& d : det.balls) {
+            if (d.kind == "cue") ++cueCount;
+            if (d.number == 4) ++purple;
+            if (d.number == 7) ++maroon;
+        }
+        CHECK(cueCount >= 1);
+        CHECK(purple >= 1);
+        CHECK(maroon >= 1);
+    }
+
     if (gFail == 0) {
         std::printf("ALL VISION TESTS PASSED\n");
         return 0;

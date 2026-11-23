@@ -557,31 +557,71 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     // the mask around the fitted core's medians with per-channel windows
     // wide enough to hold the whole gradient, then re-fit.
     {
-        long cnt = 0;
-        double sh = 0, ss = 0, sv = 0;
-        for (int y = static_cast<int>(best.y0); y < static_cast<int>(best.y1);
-             y += 2)
-            for (int x = static_cast<int>(best.x0);
-                 x < static_cast<int>(best.x1); x += 2) {
-                if (!surface[static_cast<size_t>(y) * w + x]) continue;
-                Hsv c = rgbToHsv(
-                    img.px[(static_cast<size_t>(y) * w + x) * 3],
-                    img.px[(static_cast<size_t>(y) * w + x) * 3 + 1],
-                    img.px[(static_cast<size_t>(y) * w + x) * 3 + 2]);
-                sh += c.h; ss += c.s; sv += c.v; ++cnt;
+        // Manual path (forceRect): the medians MUST come from the center of
+        // the forced rect over ALL pixels — the middle of a table is always
+        // felt, while the dominant-color mask may have locked onto the page
+        // background (navy UI) and poisoned every window.
+        Hsv med{200.0, 0.6, 0.6};
+        bool medOk = false;
+        if (manual) {
+            int cx0 = static_cast<int>(best.x0 + 0.25 * best.w());
+            int cx1 = static_cast<int>(best.x1 - 0.25 * best.w());
+            int cy0 = static_cast<int>(best.y0 + 0.25 * best.h());
+            int cy1 = static_cast<int>(best.y1 - 0.25 * best.h());
+            std::vector<double> hs, ss2, vv;
+            for (int y = cy0; y < cy1; y += 2)
+                for (int x = cx0; x < cx1; x += 2) {
+                    Hsv c = rgbToHsv(
+                        img.px[(static_cast<size_t>(y) * w + x) * 3],
+                        img.px[(static_cast<size_t>(y) * w + x) * 3 + 1],
+                        img.px[(static_cast<size_t>(y) * w + x) * 3 + 2]);
+                    hs.push_back(c.h); ss2.push_back(c.s); vv.push_back(c.v);
+                }
+            if (hs.size() > 200) {
+                auto med3 = [](std::vector<double>& v) {
+                    std::sort(v.begin(), v.end());
+                    return v[v.size() / 2];
+                };
+                med = Hsv{med3(hs), med3(ss2), med3(vv)};
+                medOk = true;
             }
-        if (cnt > 200) {
-            Hsv med{sh / cnt, ss / cnt, sv / cnt};
+        } else {
+            long cnt = 0;
+            double sh = 0, ss = 0, sv = 0;
+            for (int y = static_cast<int>(best.y0);
+                 y < static_cast<int>(best.y1); y += 2)
+                for (int x = static_cast<int>(best.x0);
+                     x < static_cast<int>(best.x1); x += 2) {
+                    if (!surface[static_cast<size_t>(y) * w + x]) continue;
+                    Hsv c = rgbToHsv(
+                        img.px[(static_cast<size_t>(y) * w + x) * 3],
+                        img.px[(static_cast<size_t>(y) * w + x) * 3 + 1],
+                        img.px[(static_cast<size_t>(y) * w + x) * 3 + 2]);
+                    sh += c.h; ss += c.s; sv += c.v; ++cnt;
+                }
+            if (cnt > 200) {
+                med = Hsv{sh / cnt, ss / cnt, sv / cnt};
+                medOk = true;
+            }
+        }
+        if (medOk) {
+            // Windows: wide enough to hold a real gradient felt (8BP spans
+            // s 0.43..0.88 / v 0.46..0.87 measured, including the darker
+            // cushion-shadow band — a narrow window carves that band out of
+            // the surface and its fragments surface as rows of fake blue
+            // balls). The v floor (0.30) still keeps the dark page
+            // background out, and the black ball stays ballish (its body
+            // reads v < 0.35).
             std::vector<uint8_t> surf2(n, 0);
             for (size_t i = 0; i < n; ++i) {
                 Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
                                  img.px[i * 3 + 2]);
                 double hd = std::fabs(c.h - med.h);
                 hd = std::min(hd, 360.0 - hd);
-                if (hd <= 25.0 && c.s >= std::max(0.10, med.s - 0.40) &&
-                    c.s <= std::min(0.95, med.s + 0.40) &&
-                    c.v >= std::max(0.08, med.v - 0.40) &&
-                    c.v <= std::min(0.95, med.v + 0.40))
+                if (hd <= 25.0 && c.s >= std::max(0.10, med.s - 0.45) &&
+                    c.s <= std::min(0.95, med.s + 0.45) &&
+                    c.v >= 0.30 &&
+                    c.v <= std::min(0.95, med.v + 0.45))
                     surf2[i] = 1;
             }
             for (int it = 0; it < 2; ++it) {
@@ -609,28 +649,42 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             Rect oldBest = best;
             bool overlaps = best2.x0 < oldBest.x1 && oldBest.x0 < best2.x1 &&
                             best2.y0 < oldBest.y1 && oldBest.y0 < best2.y1;
-            // Growth gate: the re-threshold must REFINE the same felt, not
-            // leak into the surrounding page. Real gradient felts grow the
-            // rect by well under 1% per side; a leak into page content
-            // grows it by 8-60%. Cap at 3% of the smaller side.
-            double grow = std::max(
-                std::max(oldBest.x0 - best2.x0, best2.x1 - oldBest.x1),
-                std::max(oldBest.y0 - best2.y0, best2.y1 - oldBest.y1));
-            double growLim = std::max(3.0, 0.03 * std::min(oldBest.w(),
-                                                           oldBest.h()));
-            bool rectGrew = best2.x1 - oldBest.x1 > 2 ||
-                            best2.y1 - oldBest.y1 > 2 ||
-                            oldBest.x0 - best2.x0 > 2 ||
-                            oldBest.y0 - best2.y0 > 2;
-            if (area2 > bestArea * 1.15 && overlaps && rectGrew &&
-                grow <= growLim && plausibleTableRect(best2, w, h)) {
-                surface.swap(surf2);
-                best = best2;
-                bestArea = area2;
-                feltHue = med;
-                // the dilated original stays valid for the ball pass; keep
-                // the re-thresholded (wider) one so ballish covers the far
-                // end of the table too.
+            if (manual) {
+                // Forced boundary: the rect cannot leak — it is fixed by
+                // the caller — so adopt any meaningful mask improvement to
+                // keep ballish correct on gradient felts.
+                if (area2 > bestArea * 1.10 && overlaps) {
+                    surface.swap(surf2);
+                    best = opt.forceRect;
+                    bestArea = area2;
+                    feltHue = med;
+                }
+            } else {
+                // Growth gate: the re-threshold must REFINE the same felt,
+                // not leak into the surrounding page. Per-side fraction: a
+                // real gradient felt can recover a cut edge by ~10-14% of
+                // that side, while page leaks grow by 50-85%. Cap at 15%.
+                double growFrac = 0;
+                {
+                    double gx = std::max(oldBest.x0 - best2.x0,
+                                         best2.x1 - oldBest.x1) /
+                                std::max(1.0, oldBest.w());
+                    double gy = std::max(oldBest.y0 - best2.y0,
+                                         best2.y1 - oldBest.y1) /
+                                std::max(1.0, oldBest.h());
+                    growFrac = std::max(gx, gy);
+                }
+                bool rectGrew = best2.x1 - oldBest.x1 > 2 ||
+                                best2.y1 - oldBest.y1 > 2 ||
+                                oldBest.x0 - best2.x0 > 2 ||
+                                oldBest.y0 - best2.y0 > 2;
+                if (area2 > bestArea * 1.08 && overlaps && rectGrew &&
+                    growFrac <= 0.15 && plausibleTableRect(best2, w, h)) {
+                    surface.swap(surf2);
+                    best = best2;
+                    bestArea = area2;
+                    feltHue = med;
+                }
             }
         }
     }
@@ -1486,6 +1540,40 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 res.balls[i].kind = "unknown";
                 res.balls[i].number = -1;
             }
+        }
+    }
+
+    // 8b. Merge same-ball split pairs: on gradient felts a ball whose
+    // shaded half fell out of the widened surface mask can survive as two
+    // blobs ~14 px apart (lit half + dark half). Two detections within
+    // 1.5R of each other that agree on kind or color are ONE ball — keep
+    // the larger. Genuinely touching balls sit ~2R apart and differ.
+    {
+        double mergeR = 1.5 * ballR;
+        bool mergedPair = true;
+        while (mergedPair) {
+            mergedPair = false;
+            for (size_t i = 0; i < res.balls.size(); ++i)
+                for (size_t j = i + 1; j < res.balls.size(); ++j) {
+                    const auto& a = res.balls[i];
+                    const auto& b = res.balls[j];
+                    if (std::hypot(a.px.x - b.px.x, a.px.y - b.px.y) >
+                        mergeR)
+                        continue;
+                    // Never merge a cue detection into anything: the cue
+                    // identity carries the whole aim pipeline, and a white
+                    // neighbor half a radius away is a different ball.
+                    if (a.kind == "cue" || b.kind == "cue") continue;
+                    bool kin = a.kind == b.kind;
+                    bool cin = a.color == b.color && a.color != "unknown";
+                    if (!kin && !cin) continue;
+                    size_t keep = a.rPx >= b.rPx ? i : j;
+                    size_t drop = keep == i ? j : i;
+                    res.balls.erase(res.balls.begin() +
+                                    static_cast<long>(drop));
+                    mergedPair = true;
+                    break;
+                }
         }
     }
 

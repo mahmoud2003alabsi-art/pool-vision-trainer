@@ -74,6 +74,17 @@ static double g_stabRPx = 0;
 static bool g_stabHasQuad = false, g_stabValid = false;
 static HWND g_stabGame = nullptr;
 
+// ---- Locked table boundary ------------------------------------------------
+// Calibrate-once policy (the same philosophy as manual-rect and the way
+// proven pool-analysis tools work): the felt is detected ONCE, then kept
+// FIXED for the whole session. Re-fitting every frame lets the aim line,
+// stick and ghost disc perturb the felt mask, so the boundary drifts
+// exactly while the player drags the cue. Unlock on a client resize or
+// after 5 consecutive bad detections (scene changed).
+static bool g_lockValid = false;
+static pool::Rect g_lockRect{0, 0, 0, 0};
+static int g_lockW = 0, g_lockH = 0, g_lockFail = 0;
+
 // Memory double buffer: the whole frame is composed off-screen and blitted
 // once per tick. Drawing straight onto the color-key layered window with
 // several GetDC/ReleaseDC passes makes every intermediate state visible —
@@ -1377,11 +1388,48 @@ int main() {
                     dopt.stripLines = g_args.stripLines;
                     if (g_args.ballR > 1) dopt.forceBallR = g_args.ballR;
                     if (g_args.manualRect && g_args.rectX1 > g_args.rectX0 &&
-                        g_args.rectY1 > g_args.rectY0)
+                        g_args.rectY1 > g_args.rectY0) {
                         dopt.forceRect = pool::Rect{
                             g_args.rectX0 * cap.w, g_args.rectY0 * cap.h,
                             g_args.rectX1 * cap.w, g_args.rectY1 * cap.h};
+                        g_lockValid = false;  // manual rect wins over the lock
+                    } else if (g_lockValid) {
+                        if (cap.w != g_lockW || cap.h != g_lockH) {
+                            g_lockValid = false;  // window was resized
+                        } else {
+                            dopt.forceRect = g_lockRect;  // boundary stays put
+                        }
+                    }
                     pool::DetectResult det = pool::detectBalls(cap, dopt, g_tbl);
+
+                    // Lock bookkeeping: adopt the first good felt, keep it,
+                    // and only give up after 5 consecutive bad detections.
+                    {
+                        bool hasCue = false;
+                        for (const auto& b : det.balls)
+                            if (b.kind == "cue") hasCue = true;
+                        bool good = hasCue && det.balls.size() >= 2;
+                        if (good && !g_args.manualRect) {
+                            if (!g_lockValid) {
+                                g_lockRect = det.feltRect;
+                                g_lockW = cap.w;
+                                g_lockH = cap.h;
+                                g_lockFail = 0;
+                                g_lockValid = true;
+                                LOGF("[lock] table boundary locked: "
+                                     "(%.0f,%.0f)-(%.0f,%.0f)",
+                                     g_lockRect.x0, g_lockRect.y0,
+                                     g_lockRect.x1, g_lockRect.y1);
+                            } else {
+                                g_lockFail = 0;
+                            }
+                        } else if (g_lockValid && !good) {
+                            if (++g_lockFail >= 5) {
+                                g_lockValid = false;
+                                LOGF("[lock] boundary unlocked (scene change)");
+                            }
+                        }
+                    }
 
                     // Temporal stabilization: glide the felt geometry and the
                     // ball positions so the guides stop trembling between
@@ -1508,28 +1556,71 @@ int main() {
                     }
                     if (!drewSim && g_visible)
                         drawGuides(det, shots, g_args.shots, fdc);
-                    if (!drewSim && stick.found && cueIdx >= 0) {
+                    if (g_visible && analyzed && cueIdx >= 0) {
+                        // The table boundary, drawn so the player can SEE
+                        // the locked field. While locked, det.feltRect IS
+                        // the frozen rect: it never moves with the cue.
+                        double fx0 = det.feltRect.x0, fy0 = det.feltRect.y0;
+                        double fx1 = det.feltRect.x1, fy1 = det.feltRect.y1;
+                        HPEN bpen = CreatePen(PS_SOLID, 2, RGB(255, 214, 64));
+                        HPEN bold = static_cast<HPEN>(SelectObject(fdc, bpen));
+                        MoveToEx(fdc, static_cast<LONG>(fx0),
+                                 static_cast<LONG>(fy0), nullptr);
+                        LineTo(fdc, static_cast<LONG>(fx1),
+                               static_cast<LONG>(fy0));
+                        LineTo(fdc, static_cast<LONG>(fx1),
+                               static_cast<LONG>(fy1));
+                        LineTo(fdc, static_cast<LONG>(fx0),
+                               static_cast<LONG>(fy1));
+                        LineTo(fdc, static_cast<LONG>(fx0),
+                               static_cast<LONG>(fy0));
+                        // corner ticks (12 px, outside each corner)
+                        double t = det.ballRPx * 0.9;
+                        MoveToEx(fdc, static_cast<LONG>(fx0 - t),
+                                 static_cast<LONG>(fy0), nullptr);
+                        LineTo(fdc, static_cast<LONG>(fx0),
+                               static_cast<LONG>(fy0));
+                        MoveToEx(fdc, static_cast<LONG>(fx0),
+                                 static_cast<LONG>(fy0 - t), nullptr);
+                        LineTo(fdc, static_cast<LONG>(fx0),
+                               static_cast<LONG>(fy0));
+                        MoveToEx(fdc, static_cast<LONG>(fx1 + t),
+                                 static_cast<LONG>(fy1), nullptr);
+                        LineTo(fdc, static_cast<LONG>(fx1),
+                               static_cast<LONG>(fy1));
+                        MoveToEx(fdc, static_cast<LONG>(fx1),
+                                 static_cast<LONG>(fy1 + t), nullptr);
+                        LineTo(fdc, static_cast<LONG>(fx1),
+                               static_cast<LONG>(fy1));
+                        SelectObject(fdc, bold);
+                        DeleteObject(bpen);
+                    }
+                    if (stick.found && cueIdx >= 0) {
                         // Stick hint in client px: aim arrow (cyan) + the
                         // stick butt, so the angle reads even before the
                         // game draws its guideline.
+                        // LIVE stick arrow, drawn every frame while the
+                        // stick is visible: aim direction (cyan) + the
+                        // stick butt, so the angle reads continuously
+                        // while dragging, even with the sim preview on.
                         POINT cp{static_cast<LONG>(det.balls[cueIdx].px.x),
                                  static_cast<LONG>(det.balls[cueIdx].px.y)};
                         double rr = det.ballRPx;
-                        POINT aim{static_cast<LONG>(cp.x + stick.dir.x * rr * 6),
-                                  static_cast<LONG>(cp.y + stick.dir.y * rr * 6)};
-                        POINT butt{static_cast<LONG>(cp.x - stick.dir.x * rr * 8),
-                                   static_cast<LONG>(cp.y - stick.dir.y * rr * 8)};
-                        HPEN spen = CreatePen(PS_SOLID, 2, RGB(90, 220, 255));
+                        POINT aim{static_cast<LONG>(cp.x + stick.dir.x * rr * 8),
+                                  static_cast<LONG>(cp.y + stick.dir.y * rr * 8)};
+                        POINT butt{static_cast<LONG>(cp.x - stick.dir.x * rr * 9),
+                                   static_cast<LONG>(cp.y - stick.dir.y * rr * 9)};
+                        HPEN spen = CreatePen(PS_SOLID, 3, RGB(110, 240, 255));
                         HPEN sold = static_cast<HPEN>(SelectObject(fdc, spen));
                         MoveToEx(fdc, butt.x, butt.y, nullptr);
                         LineTo(fdc, cp.x, cp.y);
                         LineTo(fdc, aim.x, aim.y);
                         double sang = std::atan2(stick.dir.y, stick.dir.x);
-                        for (double sg : {-0.42, 0.42}) {
+                        for (double sg : {-0.45, 0.45}) {
                             MoveToEx(fdc, aim.x, aim.y, nullptr);
-                            LineTo(fdc, static_cast<LONG>(aim.x - rr * 2.2 *
+                            LineTo(fdc, static_cast<LONG>(aim.x - rr * 2.8 *
                                                           std::cos(sang + sg)),
-                                   static_cast<LONG>(aim.y - rr * 2.2 *
+                                   static_cast<LONG>(aim.y - rr * 2.8 *
                                                      std::sin(sang + sg)));
                         }
                         SelectObject(fdc, sold);
@@ -1546,16 +1637,23 @@ int main() {
                                        stick.found ? L" S" : L"");
                         else
                             _snwprintf(powTxt, 16, L"pow=--");
+                        wchar_t aimTxt[16];
+                        if (stick.found)
+                            _snwprintf(aimTxt, 16, L"aim=%.0f\x00B0",
+                                       std::atan2(stick.dir.y, stick.dir.x) *
+                                               180.0 / 3.14159265358979323846);
+                        else
+                            _snwprintf(aimTxt, 16, L"aim=--");
                         wchar_t buf[200];
                         _snwprintf(buf, 200,
-                                   L"balls=%d shots=%d aim=%s pot=%d%s "
-                                   L"| %s | R=%.1f tolV=%.2f%s",
+                                   L"balls=%d shots=%d sim=%s pot=%d%s "
+                                   L"| %s %s | R=%.1f tolV=%.2f%s",
                                    static_cast<int>(balls.size()),
                                    static_cast<int>(shots.size()),
                                    drewSim ? L"ON" : L"-",
                                    drewSim ? aimPotted : 0,
                                    drewSim && aimScratch ? L" SCRATCH!" : L"",
-                                   powTxt,
+                                   aimTxt, powTxt,
                                    g_args.ballR > 1 ? g_args.ballR : det.ballRPx,
                                    g_args.feltTolV,
                                    g_args.manualRect ? L" [MAN]" : L"");

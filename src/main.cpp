@@ -67,6 +67,10 @@ struct Args {
     bool saveIni = false;
 };
 
+// Optional locked-boundary override for analyze (--felt x0,y0,x1,y1):
+// runs detection with the felt FORCED, exactly as the overlay lock does.
+static Rect g_feltRectOverride{0, 0, 0, 0};
+
 Args parseArgs(int argc, char** argv) {
     Args a;
     std::vector<std::string> pos;
@@ -105,6 +109,22 @@ Args parseArgs(int argc, char** argv) {
         } else if (s == "--dir") a.dirDeg = std::stod(need(s.c_str()));
         else if (s == "--shot") a.shotIdx = std::stoi(need(s.c_str()));
         else if (s == "--rect") a.rectOverride = need(s.c_str());
+        else if (s == "--felt") {
+            double v[4];
+            int k = 0;
+            size_t pos = 0;
+            std::string sv = need(s.c_str());
+            while (k < 4) {
+                size_t comma = sv.find(',', pos);
+                v[k++] = std::stod(sv.substr(
+                    pos, comma == std::string::npos ? sv.size() - pos
+                                                    : comma - pos));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            if (k == 4)
+                g_feltRectOverride = Rect{v[0], v[1], v[2], v[3]};
+        }
         else if (s == "--ballr") a.ballR = std::stod(need(s.c_str()));
         else if (s == "--tols") a.tolS = std::stod(need(s.c_str()));
         else if (s == "--tolv") a.tolV = std::stod(need(s.c_str()));
@@ -151,6 +171,8 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     fs::create_directories(outDir);
 
     DetectOptions dopt;
+    if (g_feltRectOverride.w() > 10 && g_feltRectOverride.h() > 10)
+        dopt.forceRect = g_feltRectOverride;  // locked-boundary verification
     DetectResult det;
     try {
         det = detectBalls(img, dopt, table);
