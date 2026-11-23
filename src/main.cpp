@@ -159,6 +159,19 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         return 1;
     }
 
+    // Live cue stick + power slider (also reported in the JSON so the
+    // angle/power readings are verifiable on any screenshot).
+    pool::CueStick stick;
+    {
+        int cueIdx = -1;
+        for (size_t i = 0; i < det.balls.size(); ++i)
+            if (det.balls[i].kind == "cue") { cueIdx = static_cast<int>(i); break; }
+        if (cueIdx >= 0)
+            stick = pool::findCueStick(img, det.balls[cueIdx].px, det.ballRPx,
+                                       det.feltRect);
+    }
+    double powSlider = pool::findPowerSlider(img, det.feltRect, det.ballRPx);
+
     TableSpec tbl = det.table;  // detected table (pockets snapped to real holes)
     if (det.hasQuad) {
         const auto& q = det.quadPx;
@@ -169,6 +182,11 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     std::cout << "table rect px: (" << det.feltRect.x0 << "," << det.feltRect.y0
               << ")-(" << det.feltRect.x1 << "," << det.feltRect.y1 << ")"
               << "  ballR_px=" << det.ballRPx << "\n";
+    std::cout << "cue stick: " << (stick.found ? "found" : "not found");
+    if (stick.found)
+        std::cout << "  aim_deg=" << std::atan2(stick.dir.y, stick.dir.x) * 180.0 / 3.14159265358979323846
+                  << "  power=" << stick.power;
+    std::cout << "  slider=" << powSlider << "\n";
     std::cout << "detected " << det.balls.size() << " balls:\n";
     for (const auto& d : det.balls) {
         std::printf("  %-5s %-8s num=%2d  logical=(%6.1f,%6.1f)  px=(%5.1f,%5.1f)"
@@ -340,7 +358,14 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
             .kvNum("felt_rect_x1", det.feltRect.x1, 1)
             .kvNum("felt_rect_y1", det.feltRect.y1, 1)
             .kvNum("ball_radius_px", det.ballRPx, 2)
-        .endObj();
+        .endObj()
+        .beginObj("cue_stick")
+            .kvBool("found", stick.found)
+            .kvRaw("dir", jsonVec2(stick.dir.x, stick.dir.y))
+            .kvNum("pull_px", stick.pullPx, 1)
+            .kvNum("power", stick.power, 3)
+        .endObj()
+        .kvNum("power_slider", powSlider, 3);
     j.beginArr("balls");
     for (const auto& d : det.balls) {
         j.beginObj()

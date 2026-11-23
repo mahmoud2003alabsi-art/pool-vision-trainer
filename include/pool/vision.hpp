@@ -92,7 +92,28 @@ struct DetectResult {
     TableSpec table;    // logical table used for coordinate mapping
     bool hasQuad = false;  // perspective-corrected felt quad available
     Quad quadPx{};         // TL,TR,BR,BL in image pixels (hasQuad only)
+    double feltMedV = 0;   // median felt brightness (adaptive white gates)
 };
+
+// The physical cue stick, found by sweeping rays of stick-colored pixels
+// from the cue ball backward. Gives the live aim angle and the pull-back
+// distance (a power proxy) while the player drags the stick.
+struct CueStick {
+    bool found = false;
+    Vec2 dir{};         // unit aim direction in image px: stick -> ball ->
+                        // target (the ball travels along this)
+    Vec2 tip{};         // stick end nearest the ball
+    double pullPx = 0;  // gap between ball edge and stick tip
+    double power = 0;   // pullPx normalized to a full draw [0..1]
+};
+
+CueStick findCueStick(const Image& img, Vec2 cuePx, double ballRPx,
+                      const Rect& field);
+
+// The 8BP power slider: a tall saturated-orange bar left of the felt with
+// a bright knob. Returns the knob fraction (0 = idle at the top, 1 = full
+// draw at the bottom) or -1 when the bar/knob is not visible.
+double findPowerSlider(const Image& img, const Rect& field, double ballRPx);
 
 // Detect the table and the balls. `logical` selects the logical table the
 // pixel coordinates are mapped into (default: TableSpec::standard()).

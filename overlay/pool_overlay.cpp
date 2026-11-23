@@ -1363,7 +1363,13 @@ int main() {
 
             pool::Image cap;
             bool analyzed = false;
-            if (captureClient(game, cap)) {
+            if (GetForegroundWindow() != game) {
+                // A BitBlt of an occluded window captures whatever covers
+                // it — analysis hallucinated balls out of browser pixels
+                // and drew guides over GitHub. Pause while covered.
+                g_status = L"game window covered - click it to front";
+                if (!g_menu.open && !g_menuHidden) drawHud(fdc, orc);
+            } else if (captureClient(game, cap)) {
                 try {
                     pool::DetectOptions dopt;
                     dopt.feltTolS = g_args.feltTolS;
@@ -1417,6 +1423,17 @@ int main() {
                         if (d.kind == "cue" && cueIdx < 0) cueIdx = static_cast<int>(i);
                         balls.push_back(b);
                     }
+
+                    // Live cue stick (angle + pull power) and the 8BP power
+                    // slider — both work while the player DRAGS, before any
+                    // ball moves.
+                    pool::CueStick stick;
+                    double powSlider = -1.0;
+                    if (cueIdx >= 0)
+                        stick = pool::findCueStick(cap, det.balls[cueIdx].px,
+                                                   det.ballRPx, det.feltRect);
+                    powSlider = pool::findPowerSlider(cap, det.feltRect,
+                                                      det.ballRPx);
                     // Aim-aware preview: while the player drags, the game draws
                     // its white guideline — predict the CURRENT aim's outcome
                     // with the physics sim. Idle frames show best-shot guides.
@@ -1429,8 +1446,16 @@ int main() {
                             if (static_cast<int>(i) != cueIdx)
                                 otherPx.push_back(det.balls[i].px);
                         pool::Vec2 dirPx;
-                        if (pool::estimateAimDirPx(cap, det.balls[cueIdx].px,
-                                                   det.ballRPx, otherPx, dirPx)) {
+                        bool haveDir = pool::estimateAimDirPx(
+                            cap, det.balls[cueIdx].px, det.ballRPx, otherPx,
+                            dirPx);
+                        if (!haveDir && stick.found) {
+                            // No game guideline visible: the physical stick
+                            // angle is the aim.
+                            dirPx = stick.dir;
+                            haveDir = true;
+                        }
+                        if (haveDir) {
                             pool::Vec2 dirL{dirPx.x, dirPx.y};
                             {
                                 // Logical aim direction: map two pixel
@@ -1483,16 +1508,54 @@ int main() {
                     }
                     if (!drewSim && g_visible)
                         drawGuides(det, shots, g_args.shots, fdc);
+                    if (!drewSim && stick.found && cueIdx >= 0) {
+                        // Stick hint in client px: aim arrow (cyan) + the
+                        // stick butt, so the angle reads even before the
+                        // game draws its guideline.
+                        POINT cp{static_cast<LONG>(det.balls[cueIdx].px.x),
+                                 static_cast<LONG>(det.balls[cueIdx].px.y)};
+                        double rr = det.ballRPx;
+                        POINT aim{static_cast<LONG>(cp.x + stick.dir.x * rr * 6),
+                                  static_cast<LONG>(cp.y + stick.dir.y * rr * 6)};
+                        POINT butt{static_cast<LONG>(cp.x - stick.dir.x * rr * 8),
+                                   static_cast<LONG>(cp.y - stick.dir.y * rr * 8)};
+                        HPEN spen = CreatePen(PS_SOLID, 2, RGB(90, 220, 255));
+                        HPEN sold = static_cast<HPEN>(SelectObject(fdc, spen));
+                        MoveToEx(fdc, butt.x, butt.y, nullptr);
+                        LineTo(fdc, cp.x, cp.y);
+                        LineTo(fdc, aim.x, aim.y);
+                        double sang = std::atan2(stick.dir.y, stick.dir.x);
+                        for (double sg : {-0.42, 0.42}) {
+                            MoveToEx(fdc, aim.x, aim.y, nullptr);
+                            LineTo(fdc, static_cast<LONG>(aim.x - rr * 2.2 *
+                                                          std::cos(sang + sg)),
+                                   static_cast<LONG>(aim.y - rr * 2.2 *
+                                                     std::sin(sang + sg)));
+                        }
+                        SelectObject(fdc, sold);
+                        DeleteObject(spen);
+                    }
                     {
-                        wchar_t buf[160];
-                        _snwprintf(buf, 160,
+                        double powPct = powSlider >= 0.0
+                                            ? powSlider * 100.0
+                                            : (stick.found ? stick.power * 100.0
+                                                           : -1.0);
+                        wchar_t powTxt[16];
+                        if (powPct >= 0)
+                            _snwprintf(powTxt, 16, L"pow=%.0f%%%s", powPct,
+                                       stick.found ? L" S" : L"");
+                        else
+                            _snwprintf(powTxt, 16, L"pow=--");
+                        wchar_t buf[200];
+                        _snwprintf(buf, 200,
                                    L"balls=%d shots=%d aim=%s pot=%d%s "
-                                   L"| R=%.1f tolV=%.2f%s",
+                                   L"| %s | R=%.1f tolV=%.2f%s",
                                    static_cast<int>(balls.size()),
                                    static_cast<int>(shots.size()),
                                    drewSim ? L"ON" : L"-",
                                    drewSim ? aimPotted : 0,
                                    drewSim && aimScratch ? L" SCRATCH!" : L"",
+                                   powTxt,
                                    g_args.ballR > 1 ? g_args.ballR : det.ballRPx,
                                    g_args.feltTolV,
                                    g_args.manualRect ? L" [MAN]" : L"");

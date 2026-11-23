@@ -263,6 +263,46 @@ int main() {
         for (const auto& d : det.balls) CHECK(d.kind != "cue");
     }
 
+    // 6. 8BP palette calibration (measured from real 8 Ball Pool renders):
+    //    yellow hue 41..62 must read ball 1, orange 15..41 ball 5, dark red
+    //    maroon ball 7 (v~0.46), purple 255..345 ball 4.
+    {
+        const int W = 1000, H = 640;
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        struct Case { int r, g, b; const char* kind; int num; };
+        const Case cases[] = {
+            {222, 180, 70, "solid", 1},    // yellow  (hue ~45)
+            {210, 140, 50, "solid", 5},    // orange  (hue ~34)
+            {120, 45, 28, "solid", 7},     // maroon  (dark red v~0.47)
+            {130, 88, 165, "solid", 4},    // purple  (hue ~280)
+            {235, 200, 40, "solid", 1},    // golden yellow (old orange bin)
+        };
+        for (const auto& cs : cases) {
+            std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+            for (size_t i = 0; i < px.size(); i += 3) {
+                px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+            }
+            for (int y = 120; y < 520; ++y)
+                for (int x = 200; x < 900; ++x)
+                    put(px, W, x, y, 55, 165, 95);
+            disc(px, W, 200 + 350 * sx, 120 + 200 * sy, 13, cs.r, cs.g, cs.b);
+            Image img = makeImage(W, H, px);
+            DetectResult det = detectBalls(img, {}, tbl);
+            bool ok = false;
+            for (const auto& d : det.balls)
+                if (d.kind == cs.kind && d.number == cs.num) ok = true;
+            if (!ok) {
+                std::printf("FAIL palette: rgb(%d,%d,%d) -> ", cs.r, cs.g,
+                            cs.b);
+                for (const auto& d : det.balls)
+                    std::printf("%s/%d ", d.kind.c_str(), d.number);
+                std::printf("\n");
+                ++gFail;
+            }
+        }
+    }
+
     if (gFail == 0) {
         std::printf("ALL VISION TESTS PASSED\n");
         return 0;

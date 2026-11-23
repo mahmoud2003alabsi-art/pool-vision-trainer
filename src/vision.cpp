@@ -14,6 +14,7 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
@@ -158,19 +159,23 @@ std::vector<Blob> findBlobs(const std::vector<uint8_t>& mask, int w, int h) {
 }
 
 std::string colorName(double hue, double coloredVal) {
+    if (hue < 0.0) return "unknown";  // no colored pixels: hue is garbage
+    // Bins calibrated on measured 8 Ball Pool renderings: yellow ball 1
+    // sits at hue 41..62, orange ball 5 at 15..41 (only ~10 deg apart),
+    // purple spans 255..345 (measured 272 and 316), maroon is a dark red
+    // (measured v 0.46).
     struct Range { const char* name; double lo, hi; };
     static const Range ranges[] = {
         {"red", 345.0, 360.0}, {"red", 0.0, 15.0},
-        {"orange", 15.0, 40.0},
-        {"yellow", 40.0, 70.0},
-        {"green", 70.0, 165.0},
+        {"orange", 15.0, 41.0},
+        {"yellow", 41.0, 62.0},
+        {"green", 62.0, 165.0},
         {"blue", 165.0, 255.0},
-        {"purple", 255.0, 320.0},
-        {"red", 320.0, 345.0},  // magenta-ish reads as the red family here
+        {"purple", 255.0, 345.0},
     };
-    // Dark red = maroon (ball 7).
+    // Dark red = maroon (ball 7); 8BP renders it at v ~0.46.
     bool inRed = (hue >= 345.0 || hue < 15.0);
-    if (inRed && coloredVal < 0.45) return "maroon";
+    if (inRed && coloredVal < 0.55) return "maroon";
     for (const auto& rg : ranges) {
         if (hue >= rg.lo && hue < rg.hi) return rg.name;
     }
@@ -450,9 +455,24 @@ bool fitTrapezoid(const std::vector<uint8_t>& surface, int w, int h,
     cand.bl = {la + lb * yBot, yBot};
     cand.br = {ra + rb * yBot, yBot};
     if (cand.tl.x >= cand.tr.x || cand.bl.x >= cand.br.x) return false;
+    // Coverage gate: the fitted edges must track the felt mask itself. A
+    // broken gradient mask produces edge fits that leave large parts of
+    // the felt OUTSIDE the quad — those project logical points to wild
+    // pixels (lines into the window corner and beyond) and must fall back
+    // to the rectangle path. Real trapezoids (Pool Club) hug the mask.
+    double outSum = 0, spanSum = 0;
+    for (size_t i = 0; i < ys.size(); ++i) {
+        if (spans[i] < 0.45 * medSpan) continue;
+        double y = ys[i];
+        double lo = la + lb * y, hi = ra + rb * y;
+        outSum += std::max(0.0, lo - xmin[i]) +
+                  std::max(0.0, xmax[i] - hi);
+        spanSum += xmax[i] - xmin[i];
+    }
+    if (spanSum <= 0 || outSum > 0.08 * spanSum) return false;
+    double topW = cand.tr.x - cand.tl.x, botW = cand.br.x - cand.bl.x;
     // Trapezoid gate: only accept when the felt actually widens toward the
     // bottom by more than 6% — flat tables keep the rectangle path.
-    double topW = cand.tr.x - cand.tl.x, botW = cand.br.x - cand.bl.x;
     double wide = std::max(topW, botW), narrow = std::min(topW, botW);
     if (wide - narrow < 0.06 * seed.w()) return false;
     q = cand;
@@ -530,10 +550,117 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         }
     }
 
+    // 2b. Adaptive re-threshold for gradient felts: 8BP renders the felt
+    // with a strong brightness/saturation gradient (lit middle s~0.43,
+    // dark rails edge s~0.88). One fixed tolerance keeps only part of the
+    // felt, the fit collapses and balls at the far end drop out. Rebuild
+    // the mask around the fitted core's medians with per-channel windows
+    // wide enough to hold the whole gradient, then re-fit.
+    {
+        long cnt = 0;
+        double sh = 0, ss = 0, sv = 0;
+        for (int y = static_cast<int>(best.y0); y < static_cast<int>(best.y1);
+             y += 2)
+            for (int x = static_cast<int>(best.x0);
+                 x < static_cast<int>(best.x1); x += 2) {
+                if (!surface[static_cast<size_t>(y) * w + x]) continue;
+                Hsv c = rgbToHsv(
+                    img.px[(static_cast<size_t>(y) * w + x) * 3],
+                    img.px[(static_cast<size_t>(y) * w + x) * 3 + 1],
+                    img.px[(static_cast<size_t>(y) * w + x) * 3 + 2]);
+                sh += c.h; ss += c.s; sv += c.v; ++cnt;
+            }
+        if (cnt > 200) {
+            Hsv med{sh / cnt, ss / cnt, sv / cnt};
+            std::vector<uint8_t> surf2(n, 0);
+            for (size_t i = 0; i < n; ++i) {
+                Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
+                                 img.px[i * 3 + 2]);
+                double hd = std::fabs(c.h - med.h);
+                hd = std::min(hd, 360.0 - hd);
+                if (hd <= 25.0 && c.s >= std::max(0.10, med.s - 0.40) &&
+                    c.s <= std::min(0.95, med.s + 0.40) &&
+                    c.v >= std::max(0.08, med.v - 0.40) &&
+                    c.v <= std::min(0.95, med.v + 0.40))
+                    surf2[i] = 1;
+            }
+            for (int it = 0; it < 2; ++it) {
+                std::vector<uint8_t> nxt = surf2;
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        size_t i = static_cast<size_t>(y) * w + x;
+                        if (nxt[i]) continue;
+                        bool nb = false;
+                        for (int dy = -1; dy <= 1 && !nb; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                int nx = x + dx, ny = y + dy;
+                                if (nx >= 0 && ny >= 0 && nx < w && ny < h &&
+                                    surf2[static_cast<size_t>(ny) * w + nx]) {
+                                    nb = true;
+                                    break;
+                                }
+                            }
+                        if (nb) nxt[i] = 1;
+                    }
+                surf2 = std::move(nxt);
+            }
+            long area2 = 0;
+            Rect best2 = largestComponent(surf2, w, h, area2);
+            Rect oldBest = best;
+            bool overlaps = best2.x0 < oldBest.x1 && oldBest.x0 < best2.x1 &&
+                            best2.y0 < oldBest.y1 && oldBest.y0 < best2.y1;
+            // Growth gate: the re-threshold must REFINE the same felt, not
+            // leak into the surrounding page. Real gradient felts grow the
+            // rect by well under 1% per side; a leak into page content
+            // grows it by 8-60%. Cap at 3% of the smaller side.
+            double grow = std::max(
+                std::max(oldBest.x0 - best2.x0, best2.x1 - oldBest.x1),
+                std::max(oldBest.y0 - best2.y0, best2.y1 - oldBest.y1));
+            double growLim = std::max(3.0, 0.03 * std::min(oldBest.w(),
+                                                           oldBest.h()));
+            bool rectGrew = best2.x1 - oldBest.x1 > 2 ||
+                            best2.y1 - oldBest.y1 > 2 ||
+                            oldBest.x0 - best2.x0 > 2 ||
+                            oldBest.y0 - best2.y0 > 2;
+            if (area2 > bestArea * 1.15 && overlaps && rectGrew &&
+                grow <= growLim && plausibleTableRect(best2, w, h)) {
+                surface.swap(surf2);
+                best = best2;
+                bestArea = area2;
+                feltHue = med;
+                // the dilated original stays valid for the ball pass; keep
+                // the re-thresholded (wider) one so ballish covers the far
+                // end of the table too.
+            }
+        }
+    }
+
     // Shrink a little to avoid the cushion/wood transition pixels.
     Rect field = best;
     field.x0 += 2; field.y0 += 2;
     field.x1 -= 2; field.y1 -= 2;
+
+    // Median felt brightness (sampled) — feeds the adaptive white gates.
+    double feltMedV = 0;
+    {
+        std::vector<double> vv;
+        for (int y = static_cast<int>(field.y0); y < static_cast<int>(field.y1);
+             y += 3)
+            for (int x = static_cast<int>(field.x0);
+                 x < static_cast<int>(field.x1); x += 3) {
+                if (!surface[static_cast<size_t>(y) * w + x]) continue;
+                vv.push_back(rgbToHsv(
+                    img.px[(static_cast<size_t>(y) * w + x) * 3],
+                    img.px[(static_cast<size_t>(y) * w + x) * 3 + 1],
+                    img.px[(static_cast<size_t>(y) * w + x) * 3 + 2]).v);
+            }
+        if (!vv.empty()) {
+            std::sort(vv.begin(), vv.end());
+            feltMedV = vv[vv.size() / 2];
+        } else {
+            feltMedV = 0.6;
+        }
+    }
 
     // Perspective fit (green auto path only): Pool Club style felts are
     // trapezoids; the quad + bilinear mapping keeps every line on measure.
@@ -753,6 +880,32 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             ok = c.area >= refArea * opt.areaLoFactor &&
                  c.area <= refArea * opt.areaHiFactor;
         if (ok) {
+            // Pocket-shadow crescents: dark saturated-blue blobs that hug
+            // the pocket holes (8BP renders them at v 0.22-0.27, r 8-10).
+            // Real balls never read that dark at blob scale — even the
+            // black 8 ball keeps a brighter disk mean.
+            double rBlob = std::sqrt(
+                static_cast<double>(c.area) / 3.14159265358979323846);
+            long vTot = 0;
+            double vSum = 0;
+            int vx0 = std::max(0, static_cast<int>(c.bbox.x0)),
+                vx1 = std::min(w - 1, static_cast<int>(c.bbox.x1));
+            int vy0 = std::max(0, static_cast<int>(c.bbox.y0)),
+                vy1 = std::min(h - 1, static_cast<int>(c.bbox.y1));
+            for (int yy = vy0; yy <= vy1; yy += 2)
+                for (int xx = vx0; xx <= vx1; xx += 2) {
+                    size_t vi = static_cast<size_t>(yy) * w + xx;
+                    if (!ballish[vi]) continue;
+                    vSum += rgbToHsv(
+                        img.px[vi * 3], img.px[vi * 3 + 1],
+                        img.px[vi * 3 + 2]).v;
+                    ++vTot;
+                }
+            double meanV = vTot > 0 ? vSum / vTot : 1.0;
+            if (meanV < 0.30 && rBlob < 0.75 * ballR) ok = false;
+            if (c.area < refArea * 0.45 && rBlob < 0.75 * ballR) ok = false;
+        }
+        if (ok) {
             // Text, name plates and elongated UI are not balls (all paths;
             // photo shadows attached under balls stay within these bounds).
             // Game screenshots additionally drop hollow rings/icons by fill.
@@ -764,69 +917,154 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 if (extent < 0.35) ok = false;
             }
         }
-        if (!ok) {
-            // Merged structures — cue + stick, cue + guideline, touching
-            // clusters — still contain a ball-sized inscribed disc. Salvage
-            // that disc and classify it; the stick/line remainder is dropped.
-            // Gates: only ball+appendage sized blobs, and the salvaged disc
-            // must not be felt-colored (shadow bands are full of discs).
-            if (c.area > refArea * 5.0) continue;
+        std::vector<Blob> parts;
+        if (ok) {
+            parts.push_back(c);
+        } else {
+            // Merged structures — cue + stick, cue + aim line + ghost disc
+            // + an object ball, touching clusters — still contain ball-
+            // sized inscribed discs. Salvage up to three of them; the
+            // stick/line remainder is dropped. 8BP draws the cue stick
+            // glued to the ball, so the merged blob routinely exceeds
+            // 5x a ball area; 12x still rejects page-scale junk.
+            if (c.area > refArea * 12.0) continue;
             if (salvaged >= 12) continue;  // junk images explode otherwise
-            Vec2 sc{};
             Rect grown{c.bbox.x0 - ballR - 2, c.bbox.y0 - ballR - 2,
                        c.bbox.x1 + ballR + 2, c.bbox.y1 + ballR + 2};
-            double sr = inscribedDisc(ballish, w, h, grown, ballR, sc);
-            if (sr < 0.72 * ballR) continue;
-            {
-                long felt = 0, tot = 0;
-                double sumS = 0, sumV = 0;
-                int ir = static_cast<int>(std::max(1.0, sr * 0.8));
-                for (int yy = static_cast<int>(sc.y) - ir;
-                     yy <= static_cast<int>(sc.y) + ir; ++yy) {
-                    for (int xx = static_cast<int>(sc.x) - ir;
-                         xx <= static_cast<int>(sc.x) + ir; ++xx) {
+            for (int probe = 0; probe < 3; ++probe) {
+                Vec2 sc{};
+                double sr = inscribedDisc(ballish, w, h, grown, ballR, sc);
+                if (sr < 0.72 * ballR) break;
+                bool good = true;
+                {
+                    long felt = 0, tot = 0;
+                    double sumS = 0, sumV = 0;
+                    int ir = static_cast<int>(std::max(1.0, sr * 0.8));
+                    for (int yy = static_cast<int>(sc.y) - ir;
+                         yy <= static_cast<int>(sc.y) + ir; ++yy) {
+                        for (int xx = static_cast<int>(sc.x) - ir;
+                             xx <= static_cast<int>(sc.x) + ir; ++xx) {
+                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                            double dx = xx - sc.x, dy = yy - sc.y;
+                            if (dx * dx + dy * dy > ir * ir) continue;
+                            ++tot;
+                            Hsv cc = rgbToHsv(img.px[(static_cast<size_t>(yy) * w + xx) * 3],
+                                              img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
+                                              img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]);
+                            sumS += cc.s;
+                            sumV += cc.v;
+                            double hd = std::fabs(cc.h - feltHue.h);
+                            hd = std::min(hd, 360.0 - hd);
+                            if (std::fabs(cc.s - feltHue.s) < 0.32 &&
+                                std::fabs(cc.v - feltHue.v) < 0.32 &&
+                                (hd < 20.0 || cc.s < 0.12)) ++felt;
+                        }
+                    }
+                    if (tot > 0 && felt > tot * 0.6) good = false;  // felt fragment
+                    // Gray/dim discs are UI junk, not balls (balls are
+                    // white, colored or black).
+                    if (tot > 0 && sumS / tot < 0.12 && sumV / tot < 0.72)
+                        good = false;
+                }
+                if (!good) {
+                    // Erase the rejected disc so the next probe can move on.
+                    int er = static_cast<int>(sr) + 1;
+                    for (int yy = static_cast<int>(sc.y) - er;
+                         yy <= static_cast<int>(sc.y) + er; ++yy)
+                        for (int xx = static_cast<int>(sc.x) - er;
+                             xx <= static_cast<int>(sc.x) + er; ++xx) {
+                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                            double dx = xx - sc.x, dy = yy - sc.y;
+                            if (dx * dx + dy * dy <= er * er)
+                                ballish[static_cast<size_t>(yy) * w + xx] = 0;
+                        }
+                    continue;
+                }
+                // Accept a further probe only if it is a DIFFERENT ball:
+                // far enough from the earlier parts of this blob (touching
+                // balls sit ~2R apart) or clearly colored. Elongated white
+                // structures (the dilated cue-fallback mask) otherwise
+                // yield chains of overlapping "balls" 10 px apart.
+                double meanSat = 0;
+                long satN = 0;
+                {
+                    int sir = static_cast<int>(std::max(1.0, sr));
+                    for (int yy = static_cast<int>(sc.y) - sir;
+                         yy <= static_cast<int>(sc.y) + sir; ++yy)
+                        for (int xx = static_cast<int>(sc.x) - sir;
+                             xx <= static_cast<int>(sc.x) + sir; ++xx) {
+                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                            double ddx = xx - sc.x, ddy = yy - sc.y;
+                            if (ddx * ddx + ddy * ddy > sir * sir) continue;
+                            meanSat += rgbToHsv(
+                                img.px[(static_cast<size_t>(yy) * w + xx) * 3],
+                                img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
+                                img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]).s;
+                            ++satN;
+                        }
+                }
+                meanSat = satN > 0 ? meanSat / satN : 0.0;
+                bool distinct = true;
+                for (const auto& pv : parts)
+                    if (std::hypot(pv.cx - sc.x, pv.cy - sc.y) <
+                            2.0 * ballR &&
+                        meanSat < 0.15) {
+                        distinct = false;
+                        break;
+                    }
+                if (!distinct) {
+                    int er = static_cast<int>(sr) + 1;
+                    for (int yy = static_cast<int>(sc.y) - er;
+                         yy <= static_cast<int>(sc.y) + er; ++yy)
+                        for (int xx = static_cast<int>(sc.x) - er;
+                             xx <= static_cast<int>(sc.x) + er; ++xx) {
+                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                            double ddx = xx - sc.x, ddy = yy - sc.y;
+                            if (ddx * ddx + ddy * ddy <= er * er)
+                                ballish[static_cast<size_t>(yy) * w + xx] = 0;
+                        }
+                    continue;
+                }
+                ++salvaged;
+                Blob cc = c;
+                cc.cx = sc.x;
+                cc.cy = sc.y;
+                cc.area = static_cast<long>(3.14159265358979323846 * sr * sr);
+                cc.bbox = Rect{sc.x - sr, sc.y - sr, sc.x + sr, sc.y + sr};
+                parts.push_back(cc);
+                // Erase a FULL ball radius: a smaller eraser re-finds a
+                // second disc inside the same ball (two detections 13px
+                // apart), which then poisons the cue isolation vote.
+                int er = static_cast<int>(sr) + 1;
+                for (int yy = static_cast<int>(sc.y) - er;
+                     yy <= static_cast<int>(sc.y) + er; ++yy)
+                    for (int xx = static_cast<int>(sc.x) - er;
+                         xx <= static_cast<int>(sc.x) + er; ++xx) {
                         if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
                         double dx = xx - sc.x, dy = yy - sc.y;
-                        if (dx * dx + dy * dy > ir * ir) continue;
-                        ++tot;
-                        Hsv cc = rgbToHsv(img.px[(static_cast<size_t>(yy) * w + xx) * 3],
-                                          img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
-                                          img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]);
-                        sumS += cc.s;
-                        sumV += cc.v;
-                        double hd = std::fabs(cc.h - feltHue.h);
-                        hd = std::min(hd, 360.0 - hd);
-                        if (std::fabs(cc.s - feltHue.s) < 0.32 &&
-                            std::fabs(cc.v - feltHue.v) < 0.32 &&
-                            (hd < 20.0 || cc.s < 0.12)) ++felt;
+                        if (dx * dx + dy * dy <= er * er)
+                            ballish[static_cast<size_t>(yy) * w + xx] = 0;
                     }
+            }
+        }
+        for (const auto& pb : parts) {
+            const Blob& c = pb;
+            bool nearPocket = false;
+            for (const auto& a : anchors)
+                if (std::hypot(c.cx - a.x, c.cy - a.y) < pocketExcl) { nearPocket = true; break; }
+            if (nearPocket) continue;
+            bool dup = false;
+            for (const auto& k : kept) {
+                // 1.05 * ballR: same-ball duplicates from aim-line splits sit
+                // closer than this; real touching balls sit ~2 radii apart.
+                if (std::hypot(k.b.cx - c.cx, k.b.cy - c.cy) < 1.05 * ballR) {
+                    dup = true;
+                    break;
                 }
-                if (tot > 0 && felt > tot * 0.6) continue;  // felt fragment
-                // Gray/dim discs are UI junk, not balls (balls are white,
-                // colored or black).
-                if (tot > 0 && sumS / tot < 0.12 && sumV / tot < 0.72) continue;
             }
-            ++salvaged;
-            c.cx = sc.x;
-            c.cy = sc.y;
-            c.area = static_cast<long>(3.14159265358979323846 * sr * sr);
-            c.bbox = Rect{sc.x - sr, sc.y - sr, sc.x + sr, sc.y + sr};
+            if (dup) continue;
+            kept.push_back({c});
         }
-        bool nearPocket = false;
-        for (const auto& a : anchors)
-            if (std::hypot(c.cx - a.x, c.cy - a.y) < pocketExcl) { nearPocket = true; break; }
-        if (nearPocket) continue;
-        bool dup = false;
-        for (const auto& k : kept) {
-            // 1.05 * ballR: same-ball duplicates from aim-line splits sit
-            // closer than this; real touching balls sit ~2 radii apart.
-            if (std::hypot(k.b.cx - c.cx, k.b.cy - c.cy) < 1.05 * ballR) {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) continue;
-        kept.push_back({c});
     }
 
     for (const auto& raw : kept) {
@@ -834,9 +1072,17 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         double r = std::sqrt(b.area / 3.14159265358979323846);
         double ir = std::max(1.0, r * 0.85);  // sampling radius inside the disc
         long whiteCnt = 0, blackCnt = 0, colCnt = 0, rimTot = 0, rimCol = 0;
+        long litCnt = 0;
+        double litX = 0, litY = 0;
         double sumS = 0, sumV = 0, sumColV = 0;
         int hist[24] = {0};
         long total = 0;
+        // Adaptive white floor: on the dark half of a gradient felt the
+        // white ball renders at v~0.54, far below the fixed 0.72 gate, and
+        // the cue disappears. White stays = low saturation + brighter than
+        // the felt, clamped under the calibrated default.
+        double whiteVMin = std::min(opt.cueValMin,
+                                    std::max(0.55, feltMedV + 0.10));
         // Center disc for the cue decision: when the blob radius runs large
         // (merged clusters), the full disc bleeds into the felt and a pure
         // white cue ball drops below the 0.80 gate. The ball CENTER is
@@ -855,7 +1101,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 ++total;
                 sumS += c.s;
                 sumV += c.v;
-                bool white = c.s < opt.cueSatMax && c.v > opt.cueValMin;
+                bool white = c.s < opt.cueSatMax && c.v > whiteVMin;
                 bool black = c.v < opt.blackValMax;
                 if (white) ++whiteCnt;
                 if (black) ++blackCnt;
@@ -872,6 +1118,16 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                     sumColV += c.v;
                     ++hist[static_cast<int>(c.h / 15.0) % 24];
                 }
+                // Lit colored pixels carry the true ball color; the
+                // shadowed half reads 10-25 deg toward red/brown and once
+                // hijacked the hue histogram (yellow read as orange).
+                if (c.s > 0.35 && c.v > 0.50) {
+                    ++litCnt;
+                    // circular mean: accumulate the unit vector
+                    double rad = c.h * 3.14159265358979323846 / 180.0;
+                    litX += std::cos(rad);
+                    litY += std::sin(rad);
+                }
             }
         }
         if (total == 0) continue;
@@ -887,7 +1143,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
                                  img.px[i * 3 + 2]);
                 ++ctot;
-                if (c.s < opt.cueSatMax && c.v > opt.cueValMin) ++cwhite;
+                if (c.s < opt.cueSatMax && c.v > whiteVMin) ++cwhite;
             }
         }
         Detection d;
@@ -901,6 +1157,18 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         d.val = sumV / total;
         int hueBin = static_cast<int>(std::max_element(hist, hist + 24) - hist);
         d.hue = (hueBin + 0.5) * 15.0;
+        // Prefer the lit-pixel circular mean when enough lit pixels exist.
+        if (litCnt >= total * 0.10 && litCnt > 4) {
+            double lh = std::atan2(litY, litX) * 180.0 /
+                        3.14159265358979323846;
+            if (lh < 0) lh += 360.0;
+            d.hue = lh;
+        }
+        // A disc with (almost) no colored pixels has no meaningful hue —
+        // an empty histogram reads bin 0 ("red") and once fabricated a
+        // "red stripe 11" out of a pure-white ghost disc. Mark it invalid;
+        // colorName() maps it to "unknown".
+        if (colCnt < total * 0.02) d.hue = -1.0;
         double coloredVal = colCnt > 0 ? sumColV / colCnt : 0.0;
         double blackRatio = static_cast<double>(blackCnt) / total;
 
@@ -923,6 +1191,10 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
             d.kind = "solid";
             d.color = colorName(d.hue, coloredVal);
             d.number = numberForColor(d.color, false);
+        }
+        if (d.color == "unknown" && d.kind != "cue" && d.kind != "black") {
+            d.kind = "unknown";
+            d.number = -1;
         }
 
         // Felt-texture fragments (shadow bands, gradient clumps) carry the
@@ -953,14 +1225,42 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         for (const auto& d : res.balls) haveCue |= d.kind == "cue";
         if (!haveCue) {
             std::vector<uint8_t> wm(n, 0);
+            double wmVMin = std::max(0.55, feltMedV);
             for (int y = static_cast<int>(field.y0); y < static_cast<int>(field.y1); ++y) {
                 for (int x = static_cast<int>(field.x0); x < static_cast<int>(field.x1); ++x) {
                     size_t i = static_cast<size_t>(y) * w + x;
                     if (!ballish[i]) continue;
                     Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
                                      img.px[i * 3 + 2]);
-                    if (c.s < 0.25 && c.v > 0.70) wm[i] = 1;
+                    // Adaptive floor: a cue on the dark half of a gradient
+                    // felt renders at v~0.54; the old fixed 0.70 gate lost
+                    // it. The line-crossed disc is then shredded — dilate
+                    // the mask so the fragments rejoin into a solid ball.
+                    if (c.s < 0.30 && c.v > wmVMin) wm[i] = 1;
                 }
+            }
+            for (int it = 0; it < 2; ++it) {
+                std::vector<uint8_t> nxt = wm;
+                for (int y = static_cast<int>(field.y0);
+                     y < static_cast<int>(field.y1); ++y)
+                    for (int x = static_cast<int>(field.x0);
+                         x < static_cast<int>(field.x1); ++x) {
+                        size_t i = static_cast<size_t>(y) * w + x;
+                        if (wm[i]) continue;
+                        bool nb = false;
+                        for (int dy = -1; dy <= 1 && !nb; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                int nx = x + dx, ny = y + dy;
+                                if (nx < 0 || ny < 0 || nx >= w || ny >= h)
+                                    continue;
+                                if (wm[static_cast<size_t>(ny) * w + nx]) {
+                                    nb = true;
+                                    break;
+                                }
+                            }
+                        if (nb) nxt[i] = 1;
+                    }
+                wm.swap(nxt);
             }
             const float INF = 1e9f;
             // Iterate deepest-first: when a candidate turns out to be the
@@ -1030,7 +1330,9 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                                          img.px[i * 3 + 2]);
                         ++tot;
                         sumV += c.v;
-                        if (c.s < 0.30 && c.v > 0.62) ++wCnt;
+                        if (c.s < 0.30 &&
+                            c.v > std::max(0.55, feltMedV))
+                            ++wCnt;
                     }
                 }
                 // Rim guard for the fallback too: a deep white core can
@@ -1123,6 +1425,25 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 bestCue = i;
             }
         }
+        // Tie-break by purity: a ghost disc drawn ON an object ball can be
+        // as white and as isolated as the cue — but the ball behind it
+        // tints it, so among candidates within 10% of the best isolation
+        // the lowest saturation wins.
+        if (bestCue >= 0 && bestIso > 2.0 * ballR) {
+            double bestSat = res.balls[bestCue].sat;
+            for (int i = 0; i < n; ++i) {
+                const auto& d = res.balls[i];
+                bool whiteish = d.rimColored < 0.25 &&
+                                (d.kind == "cue" || d.kind == "unknown" ||
+                                 d.whiteRatio > 0.45);
+                if (!whiteish || i == bestCue) continue;
+                if (nnDist(i) < 0.90 * bestIso) continue;
+                if (d.sat < bestSat - 0.005) {
+                    bestSat = d.sat;
+                    bestCue = i;
+                }
+            }
+        }
         if (bestCue >= 0 && bestIso > 2.0 * ballR) {
             for (int i = 0; i < n; ++i) {
                 auto& d = res.balls[i];
@@ -1134,6 +1455,9 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                 }
                 if (d.kind == "cue" || d.kind == "unknown") {
                     // Demote: white-heavy -> stripe, else solid by hue.
+                    // colorName() returns "unknown" for an invalid hue
+                    // (no colored pixels), and a demoted ball without a
+                    // color is not a stripe/solid at all.
                     if (d.whiteRatio > opt.stripeWhiteMin) {
                         d.kind = "stripe";
                         d.color = colorName(d.hue, d.val);
@@ -1142,6 +1466,10 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
                         d.kind = "solid";
                         d.color = colorName(d.hue, d.val);
                         d.number = numberForColor(d.color, false);
+                    }
+                    if (d.color == "unknown") {
+                        d.kind = "unknown";
+                        d.number = -1;
                     }
                 }
             }
@@ -1161,6 +1489,7 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         }
     }
 
+    res.feltMedV = feltMedV;
     return res;
 }
 
@@ -1207,6 +1536,241 @@ bool estimateAimDirPx(const Image& img, Vec2 cuePx, double ballRPx,
     double a = fine * kPi / 180.0;
     dirPx = Vec2{std::cos(a), std::sin(a)};
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Live cue stick: sweep rays of stick-colored pixels from the cue ball.
+// The 8BP stick renders as a tan/brown shaft (hue 12..55) with dark edges,
+// glued to the ball and rotating around it — its angle IS the aim angle and
+// its pull-back distance is the power.
+CueStick findCueStick(const Image& img, Vec2 cuePx, double ballRPx,
+                      const Rect& field) {
+    CueStick out;
+    const int w = img.w, h = img.h;
+    if (img.empty() || ballRPx <= 0) return out;
+    constexpr double kPi = 3.14159265358979323846;
+    auto stickPx = [&](int x, int y) {
+        if (x < 0 || y < 0 || x >= w || y >= h) return false;
+        size_t i = static_cast<size_t>(y) * w + x;
+        Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
+        if (c.h >= 12.0 && c.h <= 55.0 && c.s > 0.20 && c.v > 0.25)
+            return true;  // wood shaft (the 8BP stick reads hue 26..55)
+        // Dark shaft edge / shaft over dark UI — still BROWN (hue 5..60).
+        // Without the hue window the navy game background (hue ~210-260,
+        // v~0.26) extends every ray to the screen edge and fake sticks
+        // appear in every direction.
+        if (c.h >= 5.0 && c.h <= 60.0 && c.s < 0.55 && c.v > 0.06 &&
+            c.v < 0.32)
+            return true;
+        return false;
+    };
+    const double rStart = ballRPx * 1.45, rMax = ballRPx * 26.0;
+    // The 8BP stick runs beyond the felt into the window header (the
+    // player drags it across the whole window), so rays are bounded by
+    // the IMAGE, not the felt. Measured on real captures: the felt edge
+    // cut the visible stick to ~3R and the detector missed it.
+    const double m = 4.0;
+    (void)field;
+    // Thick rays: the shaft is only 3-4 px wide, so a single-pixel ray
+    // samples it intermittently and the run collapses. Each step probes
+    // the center plus two perpendicular offsets (+/-2 px) — a hit on any
+    // of the three counts.
+    auto rayHit = [&](double x, double y, double dx, double dy) {
+        double px = -dy, py = dx;  // perpendicular unit
+        for (double off : {0.0, -2.0, 2.0}) {
+            double sx = x + px * off, sy = y + py * off;
+            if (stickPx(static_cast<int>(sx), static_cast<int>(sy)))
+                return true;
+        }
+        return false;
+    };
+    auto rayLen = [&](double aDeg, double* tipR) {
+        double a = aDeg * kPi / 180.0;
+        double dx = std::cos(a), dy = std::sin(a);
+        double len = 0, gap = 0;
+        bool started = false;
+        for (double r = rStart; r <= rMax; r += 1.5) {
+            double x = cuePx.x + dx * r, y = cuePx.y + dy * r;
+            if (x < -m || y < -m || x > w + m || y > h + m)
+                break;
+            if (rayHit(x, y, dx, dy)) {
+                if (!started && r > rStart + ballRPx * 14.0) break;
+                started = true;
+                len = r - rStart + ballRPx;
+                gap = 0;
+            } else if (started) {
+                gap += 1.5;
+                if (gap > ballRPx * 1.2) break;  // stick ended
+            }
+        }
+        if (tipR && started) {
+            // walk back to the first sustained hit for the tip
+            int hits = 0;
+            for (double r = rStart; r <= rStart + ballRPx * 14.0; r += 1.5) {
+                double x = cuePx.x + dx * r, y = cuePx.y + dy * r;
+                if (rayHit(x, y, dx, dy)) {
+                    if (++hits >= 3) { *tipR = r; break; }
+                } else {
+                    hits = 0;
+                }
+            }
+        }
+        return len;
+    };
+    // Coarse sweep, 2 deg steps.
+    int bestA = -1;
+    double bestLen = 0;
+    std::vector<double> lens(180, 0.0);
+    for (int ai = 0; ai < 180; ++ai) {
+        double len = rayLen(ai * 2.0, nullptr);
+        lens[ai] = len;
+        if (len > bestLen) {
+            bestLen = len;
+            bestA = ai;
+        }
+    }
+    if (bestA < 0 || bestLen < ballRPx * 5.0) return out;
+    // The stick is straight: neighbors within +-2 deg must agree, so a
+    // lone rail edge or a wood-colored UI strip cannot win.
+    double agree = 0;
+    for (int d = -2; d <= 2; ++d)
+        agree = std::max(agree, lens[(bestA + d + 180) % 180]);
+    if (agree < bestLen * 0.55) return out;
+    // Fine sweep, 0.5 deg steps.
+    double bestFine = bestA * 2.0, bestScore = -1;
+    for (double f = bestA * 2.0 - 2.0; f <= bestA * 2.0 + 2.0; f += 0.5) {
+        double len = rayLen(f, nullptr);
+        if (len > bestScore) {
+            bestScore = len;
+            bestFine = f;
+        }
+    }
+    double a = bestFine * kPi / 180.0;
+    // The stick extends from the ball at angle a; the aim direction runs
+    // from the stick INTO the ball and beyond.
+    out.dir = {-std::cos(a), -std::sin(a)};
+    double tipR = 0;
+    rayLen(bestFine, &tipR);
+    if (tipR <= 0) return out;
+    out.tip = {cuePx.x + std::cos(a) * tipR, cuePx.y + std::sin(a) * tipR};
+    out.pullPx = std::max(0.0, tipR - ballRPx);
+    out.found = true;
+    // A full draw pulls the tip back by roughly 8 ball radii.
+    out.power = std::min(1.0, out.pullPx / (8.0 * ballRPx));
+    return out;
+}
+
+// The 8BP power slider: a tall saturated-orange bar left of the felt with a
+// bright knob. 0 = knob at the top (idle), 1 = knob at the bottom (full
+// draw). Returns -1 when the bar or the knob is not visible.
+double findPowerSlider(const Image& img, const Rect& field, double ballRPx) {
+    const int w = img.w, h = img.h;
+    if (img.empty() || ballRPx <= 0) return -1.0;
+    int x1 = static_cast<int>(field.x0) - static_cast<int>(ballRPx * 1.2);
+    int x0 = x1 - static_cast<int>(ballRPx * 12.0);
+    if (x1 <= x0 || x1 <= 0) return -1.0;
+    if (x0 < 0) x0 = 0;
+    if (x1 >= w) x1 = w - 1;
+    auto cls = [&](int x, int y) {
+        // 0 = not bar, 1 = bar body (bright orange), 2 = knob (whiter).
+        // The knob must count as bar so it does not SPLIT the column run.
+        if (x < 0 || y < 0 || x >= w || y >= h) return 0;
+        size_t i = static_cast<size_t>(y) * w + x;
+        Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1], img.px[i * 3 + 2]);
+        if (c.h >= 10.0 && c.h <= 45.0 && c.s > 0.45 && c.v > 0.40) return 1;
+        if (c.h >= 10.0 && c.h <= 60.0 && c.s > 0.10 && c.s < 0.45 &&
+            c.v > 0.85)
+            return 2;
+        return 0;
+    };
+    // Per-column longest bar run (single pass over the strip).
+    std::vector<int> runLen(w, 0), runY0(w, -1), runY1(w, -1);
+    for (int x = x0; x <= x1; ++x) {
+        int run = 0, y0 = -1, brun = 0, by0 = -1, by1 = -1;
+        for (int y = 0; y < h; ++y) {
+            int cl = cls(x, y);
+            if (cl) {
+                if (run == 0) y0 = y;
+                ++run;
+                if (run > brun) {
+                    brun = run;
+                    by0 = y0;
+                    by1 = y;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        runLen[x] = brun;
+        runY0[x] = by0;
+        runY1[x] = by1;
+    }
+    int bestCol = -1, bestRun = 0;
+    for (int x = x0; x <= x1; ++x)
+        if (runLen[x] > bestRun) {
+            bestRun = runLen[x];
+            bestCol = x;
+        }
+    if (bestCol < 0 || bestRun < ballRPx * 4.0) return -1.0;
+    int bestY0 = runY0[bestCol], bestY1 = runY1[bestCol];
+    // Bar width: neighbouring columns with a comparably long run. The
+    // bar is narrow (5-8 px) and surrounded by the dark page background —
+    // sampling medians beyond the bar edge would poison them with black.
+    int bx0 = bestCol, bx1 = bestCol;
+    while (bx0 - 1 >= x0 && runLen[bx0 - 1] >= bestRun * 0.6) --bx0;
+    while (bx1 + 1 <= x1 && runLen[bx1 + 1] >= bestRun * 0.6) ++bx1;
+    // Bar body statistics (body class only) from the bar columns.
+    long nS = 0;
+    double sumS = 0, sumV = 0;
+    for (int y = bestY0; y <= bestY1; ++y)
+        for (int x = bx0; x <= bx1; ++x) {
+            size_t i = static_cast<size_t>(y) * w + x;
+            Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
+                             img.px[i * 3 + 2]);
+            bool body = c.h >= 10.0 && c.h <= 45.0 && c.s > 0.45 &&
+                        c.v > 0.40;
+            if (!body) continue;
+            sumS += c.s;
+            sumV += c.v;
+            ++nS;
+        }
+    if (nS < 10) return -1.0;
+    double medS = sumS / nS, medV = sumV / nS;
+    // Knob: the row band whose pixels are distinctly whiter than the bar
+    // body (saturation drop). Some skins show no marker while idle —
+    // report unknown (-1) then, never a fake number.
+    int bRun = 0, bRun0 = -1, knobRun = 0, run0 = -1;
+    for (int y = bestY0; y <= bestY1; ++y) {
+        bool b = false;
+        for (int x = bx0; x <= bx1; ++x) {
+            size_t i = static_cast<size_t>(y) * w + x;
+            Hsv c = rgbToHsv(img.px[i * 3], img.px[i * 3 + 1],
+                             img.px[i * 3 + 2]);
+            if (c.v > medV + 0.02 && c.s < medS - 0.15) {
+                b = true;
+                break;
+            }
+        }
+        if (b) {
+            if (run0 < 0) run0 = y;
+            ++knobRun;
+            if (knobRun > bRun) {
+                bRun = knobRun;
+                bRun0 = run0;
+            }
+        } else {
+            knobRun = 0;
+            run0 = -1;
+        }
+    }
+    if (bRun < 2) return -1.0;
+    double barH = static_cast<double>(bestY1 - bestY0);
+    if (barH < 1.0) return -1.0;
+    double knobC = bRun0 + bRun * 0.5;
+    double frac = (knobC - bestY0) / barH;
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
+    return frac;
 }
 
 }  // namespace pool

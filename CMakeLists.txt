@@ -79,3 +79,7 @@ add_test(NAME vision_tests COMMAND pool_tests_vision)
 add_executable(pool_tests_stab tests/test_stabilize.cpp)
 target_link_libraries(pool_tests_stab PRIVATE poolvision)
 add_test(NAME stabilize_tests COMMAND pool_tests_stab)
+
+add_executable(pool_tests_stick tests/test_stick.cpp)
+target_link_libraries(pool_tests_stick PRIVATE poolvision)
+add_test(NAME stick_tests COMMAND pool_tests_stick)
