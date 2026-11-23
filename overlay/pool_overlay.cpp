@@ -21,6 +21,7 @@
 #include "pool/solver.hpp"
 #include "pool/physics.hpp"
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -54,6 +55,7 @@ struct Args {
     double feltTolV = 0.30;
     bool stripLines = true;
     bool aimPreview = true;
+    bool trainer = true;       // classic trainer look: guide lines for every ball
     bool manualRect = false;
     double rectX0 = 0, rectY0 = 0, rectX1 = 1, rectY1 = 1;  // client fractions
 };
@@ -135,6 +137,7 @@ void applyIni(Args& a, const std::wstring& path) {
     if (strVal("fps")) a.fps = static_cast<int>(numVal("fps"));
     if (strVal("guides")) g_visible = numVal("guides") != 0;
     if (strVal("aimPreview")) a.aimPreview = numVal("aimPreview") != 0;
+    if (strVal("trainer")) a.trainer = numVal("trainer") != 0;
     if (strVal("ballR")) a.ballR = numVal("ballR");
     if (strVal("feltTolS")) a.feltTolS = numVal("feltTolS");
     if (strVal("feltTolV")) a.feltTolV = numVal("feltTolV");
@@ -167,11 +170,12 @@ void saveIni() {
     }
     int n = std::snprintf(buf, sizeof(buf),
         "window=%s\ntableW=%.0f\ntableH=%.0f\nrails=%d\nshots=%d\n"
-        "fps=%d\nguides=%d\naimPreview=%d\nballR=%.1f\nfeltTolS=%.2f\n"
+        "fps=%d\nguides=%d\naimPreview=%d\ntrainer=%d\nballR=%.1f\nfeltTolS=%.2f\n"
         "feltTolV=%.2f\nstripLines=%d\nmanualRect=%d\n"
         "rectX0=%.4f\nrectY0=%.4f\nrectX1=%.4f\nrectY1=%.4f\n",
         winNarrow.c_str(), g_args.tw, g_args.th, g_args.rails, g_args.shots,
         g_args.fps, g_visible ? 1 : 0, g_args.aimPreview ? 1 : 0,
+        g_args.trainer ? 1 : 0,
         g_args.ballR, g_args.feltTolS, g_args.feltTolV,
         g_args.stripLines ? 1 : 0, g_args.manualRect ? 1 : 0, g_args.rectX0,
         g_args.rectY0, g_args.rectX1, g_args.rectY1);
@@ -199,6 +203,7 @@ Args parseArgs() {
         else if (s == L"--tolv") a.feltTolV = _wtof(next().c_str());
         else if (s == L"--no-strip") a.stripLines = false;
         else if (s == L"--no-aim") a.aimPreview = false;
+        else if (s == L"--no-trainer") a.trainer = false;
         else if (s == L"--manual-rect") a.manualRect = true;
         else if (s == L"--rect") {
             std::wstring v = next();
@@ -480,6 +485,8 @@ static void rebuildTabs() {
     aim.ctrls.push_back({mui::CT_Check, "Show guides", &g_visible});
     aim.ctrls.push_back(
         {mui::CT_Check, "Aim preview while aiming", &g_args.aimPreview});
+    aim.ctrls.push_back(
+        {mui::CT_Check, "Trainer lines (all balls)", &g_args.trainer});
     aim.ctrls.push_back(
         {mui::CT_Slider, "Rails", nullptr, &mRails, nullptr, 0.f, 3.f, nullptr,
          0, "%.0f"});
@@ -813,9 +820,33 @@ void clearOverlay() {
 
 // Draw the best shots' guides in client pixel coordinates. The overlay is
 // exactly the game client size, so client coords map 1:1.
-// Minimal drawing, as requested: ONLY the table border, the ball circles
-// and the shot lines. All mapping goes through the perspective quad when
-// the felt was fitted as a trapezoid, so lines land on the drawn table.
+static void drawArrow(HDC dc, POINT a, POINT b, COLORREF col, int wdt) {
+    HPEN pen = CreatePen(PS_SOLID, wdt, col);
+    HGDIOBJ old = SelectObject(dc, pen);
+    MoveToEx(dc, a.x, a.y, nullptr);
+    LineTo(dc, b.x, b.y);
+    double ang = std::atan2(static_cast<double>(b.y - a.y),
+                            static_cast<double>(b.x - a.x));
+    const double len = std::max(7.0, wdt * 5.0);
+    const double spread = 0.42;
+    for (double sg : {-spread, spread}) {
+        double ex = b.x - len * std::cos(ang + sg);
+        double ey = b.y - len * std::sin(ang + sg);
+        MoveToEx(dc, b.x, b.y, nullptr);
+        LineTo(dc, static_cast<LONG>(ex), static_cast<LONG>(ey));
+    }
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+
+// Trainer-style drawing (the classic 8BP trainer look):
+//   - table border + ball circles,
+//   - thin guide lines for EVERY ball's best shot (cue->ghost, ghost->pocket
+//     with an arrowhead), ghost rings,
+//   - the best 3 shots drawn thick: full cue path incl. cushion bounces,
+//     ghost circle, object path, pocket ring and a tangent arrow.
+// All mapping goes through the perspective quad when the felt was fitted as
+// a trapezoid, so lines land on the drawn table.
 void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& shots,
                 int topN) {
     if (!g_ov) return;
@@ -877,6 +908,62 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
         DeleteObject(pen);
     }
 
+    // Classic trainer lines: the best shot for EVERY object ball, thin.
+    // Direct shots preferred over banks, banks over kicks; shots arrive
+    // sorted by confidence so the first seen per ball is its best.
+    if (g_args.trainer && g_visible && shots.size() >= 1 &&
+        det.balls.size() >= 2) {
+        auto typeRank = [](const pool::Shot& x) {
+            return x.typeName == "direct" ? 0 : (x.typeName == "bank" ? 1 : 2);
+        };
+        std::map<int, const pool::Shot*> perBall;
+        for (const auto& s : shots) {
+            auto it = perBall.find(s.objectIdx);
+            if (it == perBall.end()) {
+                perBall[s.objectIdx] = &s;
+                continue;
+            }
+            if (typeRank(s) < typeRank(*it->second)) it->second = &s;
+        }
+        const COLORREF cueThin = RGB(205, 230, 255);
+        const COLORREF objThin = RGB(255, 215, 80);
+        const COLORREF kickThin = RGB(95, 220, 255);
+        const COLORREF ringDim = RGB(150, 180, 210);
+        for (const auto& kv : perBall) {
+            const pool::Shot& s = *kv.second;
+            // Cue -> ghost (thin; cyan for kicks).
+            for (size_t k = 0; k + 1 < s.cuePath.size(); ++k)
+                drawArrow(dc, toPx(s.cuePath[k]), toPx(s.cuePath[k + 1]),
+                          s.typeName == "kick" ? kickThin : cueThin, 1);
+            // Ghost ring (thin, dim).
+            if (s.typeName != "kick") {
+                POINT g = toPx(s.ghost);
+                HPEN pen = CreatePen(PS_SOLID, 1, ringDim);
+                HGDIOBJ oldPen = SelectObject(dc, pen);
+                HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Ellipse(dc, g.x - ballPx, g.y - ballPx, g.x + ballPx,
+                        g.y + ballPx);
+                SelectObject(dc, oldBr);
+                SelectObject(dc, oldPen);
+                DeleteObject(pen);
+            }
+            // Ghost -> pocket, arrowhead at the pocket end (thin yellow).
+            for (size_t k = 0; k + 1 < s.objPath.size(); ++k) {
+                POINT a = toPx(s.objPath[k]), b = toPx(s.objPath[k + 1]);
+                if (k + 2 == s.objPath.size()) {
+                    drawArrow(dc, a, b, objThin, 1);
+                } else {
+                    HPEN pen = CreatePen(PS_SOLID, 1, objThin);
+                    HGDIOBJ oldPen = SelectObject(dc, pen);
+                    MoveToEx(dc, a.x, a.y, nullptr);
+                    LineTo(dc, b.x, b.y);
+                    SelectObject(dc, oldPen);
+                    DeleteObject(pen);
+                }
+            }
+        }
+    }
+
     if (g_visible && shots.size() >= 1 && det.balls.size() >= 1) {
         const int nDraw =
             std::min<int>({topN, 3, static_cast<int>(shots.size())});
@@ -909,11 +996,24 @@ void drawGuides(const pool::DetectResult& det, const std::vector<pool::Shot>& sh
             }
             if (s.pocketIdx >= 0 && s.pocketIdx < static_cast<int>(tbl.pockets.size())) {
                 POINT p = toPx(tbl.pockets[s.pocketIdx].pos);
+                HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                HPEN rpen = CreatePen(PS_SOLID, 2, RGB(255, 70, 70));
+                HGDIOBJ oldPen2 = SelectObject(dc, rpen);
+                Ellipse(dc, p.x - 7, p.y - 7, p.x + 7, p.y + 7);
+                SelectObject(dc, oldPen2);
+                DeleteObject(rpen);
                 HBRUSH yb = CreateSolidBrush(RGB(255, 255, 0));
-                HGDIOBJ ob = SelectObject(dc, yb);
-                Ellipse(dc, p.x - 5, p.y - 5, p.x + 5, p.y + 5);
-                SelectObject(dc, ob);
-                DeleteObject(yb);
+                oldBr = SelectObject(dc, yb);
+                Ellipse(dc, p.x - 3, p.y - 3, p.x + 3, p.y + 3);
+                SelectObject(dc, oldBr);
+            }
+            // Tangent arrow: where the cue ball departs after contact.
+            if (s.typeName == "direct") {
+                POINT g = toPx(s.ghost);
+                const double len = ballPx * 2.6;
+                POINT t{g.x + static_cast<LONG>(s.tangentDir.x * len),
+                        g.y + static_cast<LONG>(s.tangentDir.y * len)};
+                drawArrow(dc, g, t, RGB(220, 235, 255), 1);
             }
             SelectObject(dc, oldPen);
             DeleteObject(pen);

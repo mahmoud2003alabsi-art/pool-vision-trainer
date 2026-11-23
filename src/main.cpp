@@ -33,6 +33,7 @@
 #include "pool/vision.hpp"
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -115,6 +116,16 @@ Args parseArgs(int argc, char** argv) {
     }
     if (!pos.empty()) a.in = pos[0];
     return a;
+}
+
+static void drawArrowPng(Image& img, Vec2 a, Vec2 b, Rgb col, int wdt) {
+    drawLine(img, a, b, col, wdt);
+    double ang = std::atan2(b.y - a.y, b.x - a.x);
+    double len = std::max(6.0, wdt * 4.0);
+    for (double sg : {-0.42, 0.42}) {
+        Vec2 e{b.x - len * std::cos(ang + sg), b.y - len * std::sin(ang + sg)};
+        drawLine(img, b, e, col, wdt);
+    }
 }
 
 Rgb shotColor(int i) {
@@ -201,15 +212,27 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     }
 
     // ----- annotated image -------------------------------------------------
+    // Rendered exactly like the live overlay: perspective quad mapping,
+    // trainer guide lines for every ball, thick best-3, arrows and rings.
     Image ann = img;
+    auto toPx = [&](Vec2 logical) {
+        if (det.hasQuad)
+            return quadLogicalToPx(det.quadPx, logical, tbl.w, tbl.h);
+        return Vec2{det.feltRect.x0 + logical.x / tbl.w * det.feltRect.w(),
+                    det.feltRect.y0 + logical.y / tbl.h * det.feltRect.h()};
+    };
+    auto scaleW = [&]() {
+        return det.hasQuad
+                   ? ((det.quadPx.tr.x - det.quadPx.tl.x) +
+                      (det.quadPx.br.x - det.quadPx.bl.x)) / 2
+                   : det.feltRect.w();
+    };
+    const double ballPx = tbl.ballR * scaleW() / tbl.w;
     drawRect(ann, det.feltRect, {90, 190, 90}, 1);
-    // Pocket markers.
+    // Pocket markers (red rings, quad-corrected).
     for (const auto& pk : tbl.pockets) {
-        // Logical -> px mapping uses the felt rect.
-        double pxX = det.feltRect.x0 + pk.pos.x / tbl.w * det.feltRect.w();
-        double pxY = det.feltRect.y0 + pk.pos.y / tbl.h * det.feltRect.h();
-        drawCircle(ann, {pxX, pxY}, tbl.pocketR * det.feltRect.w() / tbl.w,
-                   {220, 90, 90}, 2);
+        Vec2 p = toPx(pk.pos);
+        drawCircle(ann, p, tbl.pocketR * scaleW() / tbl.w, {255, 70, 70}, 2);
     }
     // Balls + labels.
     for (const auto& d : det.balls) {
@@ -217,25 +240,51 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         drawTextCentered(ann, d.px + Vec2{0, -d.rPx - 10}, labelFor(d),
                          {80, 220, 255}, 2);
     }
-    // Top shots: draw the best last so it sits on top; label each shot at
-    // its ghost position (distinct per shot) to avoid overlapping text.
+    // Classic trainer guide lines: the best shot for EVERY object ball,
+    // thin (direct > bank > kick; shots arrive confidence-sorted).
+    {
+        auto typeRank = [](const Shot& x) {
+            return x.typeName == "direct" ? 0 : (x.typeName == "bank" ? 1 : 2);
+        };
+        std::map<int, const Shot*> perBall;
+        for (const auto& s : shots) {
+            auto it = perBall.find(s.objectIdx);
+            if (it == perBall.end()) {
+                perBall[s.objectIdx] = &s;
+                continue;
+            }
+            if (typeRank(s) < typeRank(*it->second)) it->second = &s;
+        }
+        const Rgb cueThin{205, 230, 255};
+        const Rgb objThin{255, 215, 80};
+        const Rgb kickThin{95, 220, 255};
+        const Rgb ringDim{150, 180, 210};
+        for (const auto& kv : perBall) {
+            const Shot& s = *kv.second;
+            Rgb cc = s.typeName == "kick" ? kickThin : cueThin;
+            for (size_t k = 0; k + 1 < s.cuePath.size(); ++k)
+                drawArrowPng(ann, toPx(s.cuePath[k]), toPx(s.cuePath[k + 1]),
+                             cc, 1);
+            if (s.typeName != "kick")
+                drawCircle(ann, toPx(s.ghost), ballPx, ringDim, 1);
+            for (size_t k = 0; k + 1 < s.objPath.size(); ++k)
+                drawArrowPng(ann, toPx(s.objPath[k]), toPx(s.objPath[k + 1]),
+                             objThin, 1);
+        }
+    }
+
+    // Top shots drawn thick on top, with rank labels.
     int nDraw = std::min<int>(top, static_cast<int>(shots.size()));
     for (int rank = nDraw - 1; rank >= 0; --rank) {
         const Shot& s = shots[rank];
         Rgb col = shotColor(rank);
-
-        auto toPx = [&](Vec2 logical) {
-            return Vec2{det.feltRect.x0 + logical.x / tbl.w * det.feltRect.w(),
-                        det.feltRect.y0 + logical.y / tbl.h * det.feltRect.h()};
-        };
 
         // Cue path (dashed) + ghost circle.
         for (size_t k = 0; k + 1 < s.cuePath.size(); ++k)
             drawLine(ann, toPx(s.cuePath[k]), toPx(s.cuePath[k + 1]), col, 2,
                      true, 8);
         if (s.typeName != "kick")
-            drawCircle(ann, toPx(s.ghost), tbl.ballR * det.feltRect.w() / tbl.w,
-                       col, 2);
+            drawCircle(ann, toPx(s.ghost), ballPx, col, 2);
         // Object path (solid) + bounce markers.
         for (size_t k = 0; k + 1 < s.objPath.size(); ++k)
             drawLine(ann, toPx(s.objPath[k]), toPx(s.objPath[k + 1]), col, 2);
@@ -243,13 +292,17 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
             Vec2 p = toPx(s.objPath[k]);
             drawCircle(ann, p, 4, col, 1, true);
         }
-        // 90-degree tangent hint at the ghost (direct shots only).
+        // Pocket ring (red) + dot (yellow).
+        if (s.pocketIdx >= 0 && s.pocketIdx < static_cast<int>(tbl.pockets.size())) {
+            Vec2 p = toPx(tbl.pockets[s.pocketIdx].pos);
+            drawCircle(ann, p, ballPx * 0.85, {255, 70, 70}, 2);
+            drawCircle(ann, p, ballPx * 0.3, {255, 255, 0}, 2);
+        }
+        // Tangent arrow: cue departure after contact (direct shots).
         if (s.typeName == "direct") {
             Vec2 g = toPx(s.ghost);
-            Vec2 tdir = s.tangentDir;
-            double scale = tbl.ballR * det.feltRect.w() / tbl.w * 2.2;
-            drawLine(ann, g - tdir * scale, g + tdir * scale, {150, 150, 160}, 1,
-                     true, 5);
+            Vec2 t = g + s.tangentDir * (ballPx * 2.6);
+            drawArrowPng(ann, g, t, {220, 235, 255}, 1);
         }
         // Rank + stats label near the ghost (direct/bank) or near the first
         // bounce (kick), offset downward per rank to avoid collisions.
@@ -257,7 +310,7 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         if (s.typeName == "kick" && s.cuePath.size() >= 2)
             labelAt = toPx((s.cuePath[0] + s.cuePath[1]) / 2.0);
         else
-            labelAt = toPx(s.ghost) + Vec2{0, tbl.ballR * det.feltRect.w() / tbl.w + 6};
+            labelAt = toPx(s.ghost) + Vec2{0, ballPx + 6};
         char buf[64];
         std::snprintf(buf, sizeof(buf), "#%d %s CUT=%.0f CONF=%.2f",
                       rank + 1, s.typeName.c_str(),
