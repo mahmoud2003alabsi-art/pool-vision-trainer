@@ -68,6 +68,11 @@ bool g_menuHidden = false;  // Insert: hide panel + HUD, keep only the guides
 
 // Temporal stabilization state (anti-jitter).
 static pool::BallStabilizer g_ballStab;
+// Frames the best-shot guides may linger while the stick is briefly not
+// visible (one missed frame between aims). Cleared whenever the scene
+// churns — stale guides from before a shot are exactly the "arrow that
+// doesn't follow the ball" bug.
+static int g_guideHold = 0;
 static pool::Rect g_stabRect;
 static pool::Quad g_stabQuad;
 static double g_stabRPx = 0;
@@ -1621,8 +1626,14 @@ int main() {
                                             pool::SolverOptions{g_args.rails, 80.0, 0.98});
                         shots = solver.allShots();
                     }
-                    if (!drewSim && g_visible)
+                    if (stick.found && cueIdx >= 0) g_guideHold = 3;
+                    else if (g_guideHold > 0) --g_guideHold;
+                    if (!drewSim && g_visible &&
+                        (stick.found ||
+                         (g_guideHold > 0 && !g_ballStab.churned())))
                         drawGuides(det, shots, g_args.shots, fdc);
+                    else if (!stick.found && g_ballStab.churned())
+                        g_guideHold = 0;
                     if (g_visible && analyzed && cueIdx >= 0) {
                         // The table boundary, drawn so the player can SEE
                         // the locked field. While locked, det.feltRect IS

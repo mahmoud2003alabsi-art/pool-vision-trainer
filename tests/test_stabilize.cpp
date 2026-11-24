@@ -155,6 +155,78 @@ int main() {
         CHECK_NEAR(balls[0].px.x, 180.0, 1e-9);
     }
 
+    // 9. Shot churn: several balls jump far in one frame -> the whole
+    //    scene snaps to the fresh positions (no glide, no stale holds),
+    //    and churned() reports true so guides are not held over it.
+    {
+        BallStabilizer st;
+        std::vector<Detection> balls;
+        for (int k = 0; k < 6; ++k) {
+            Detection d;
+            d.px = {100.0 + 40 * k, 200.0};
+            d.kind = "solid";
+            balls.push_back(d);
+        }
+        st.apply(balls, 12.0);
+        st.apply(balls, 12.0);  // settle: tracks exist and match
+        CHECK(!st.churned());
+        for (int k = 0; k < 4; ++k)
+            balls[k].px = {100.0 + 40 * k + 60.0, 260.0};  // struck balls
+        std::vector<Detection> fresh = balls;
+        st.apply(balls, 12.0);
+        CHECK(st.churned());
+        CHECK(balls.size() == fresh.size());
+        for (size_t i = 0; i < balls.size(); ++i) {
+            CHECK_NEAR(balls[i].px.x, fresh[i].px.x, 1e-9);  // snapped
+            CHECK_NEAR(balls[i].px.y, fresh[i].px.y, 1e-9);
+        }
+        // Next static frame: no churn, tracks re-established.
+        st.apply(balls, 12.0);
+        CHECK(!st.churned());
+    }
+
+    // 10. Single-ball knock: one ball jumped beyond the snap radius snaps
+    //     exactly, the others still glide, and the scene is not churn.
+    {
+        BallStabilizer st;
+        std::vector<Detection> balls;
+        for (int k = 0; k < 5; ++k) {
+            Detection d;
+            d.px = {150.0 + 50 * k, 300.0};
+            d.kind = "solid";
+            balls.push_back(d);
+        }
+        st.apply(balls, 12.0);
+        st.apply(balls, 12.0);
+        balls[2].px = {250.0 + 20.0, 300.0};  // 20 px >> 0.8*12
+        Detection moved = balls[2];
+        st.apply(balls, 12.0);
+        CHECK(!st.churned());
+        CHECK_NEAR(balls[2].px.x, 270.0, 1e-9);   // snapped to fresh
+        CHECK_NEAR(balls[0].px.x, 150.0, 0.75);   // neighbors glided
+        (void)moved;
+    }
+
+    // 11. Default hold is short: a vanished ball bridges 2 frames, then
+    //     drops, so guides never draw on long-stale positions.
+    {
+        BallStabilizer st;  // default holdFrames == 2
+        Detection a;
+        a.px = {100, 100};
+        a.kind = "solid";
+        std::vector<Detection> balls{a};
+        st.apply(balls, 12.0);
+        balls.clear();
+        st.apply(balls, 12.0);
+        CHECK(balls.size() == 1);  // held (age 1)
+        balls.clear();
+        st.apply(balls, 12.0);
+        CHECK(balls.size() == 1);  // held (age 2)
+        balls.clear();
+        st.apply(balls, 12.0);     // age 3 > hold 2
+        CHECK(balls.empty());
+    }
+
     if (gFail == 0) std::printf("stabilize tests OK\n");
     return gFail == 0 ? 0 : 1;
 }

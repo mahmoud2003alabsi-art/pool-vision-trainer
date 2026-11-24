@@ -16,17 +16,35 @@ if ! command -v agent-browser >/dev/null 2>&1; then
 fi
 if ! command -v python3 >/dev/null 2>&1; then echo "[!] python3 missing"; exit 2; fi
 
-python3 -m http.server 8791 --directory "$HERE" >/dev/null 2>&1 &
-SRV=$!
-sleep 1
-trap 'kill $SRV 2>/dev/null' EXIT
+# No HTTP server: the pages are plain canvas, so headless Chrome loads
+# them straight from file:// (a server spawned inside this script got
+# reaped with the process group mid-run and every screenshot came back
+# white — file:// removes that whole failure class).
 
-run_case() {  # name w h url
-  local name="$1" w="$2" h="$3" url="$4"
+shot_stable() {  # url file: screenshot, retry while the frame is blank
+  local url="$1" file="$2" try
+  for try in 1 2 3 4; do
+    agent-browser screenshot "$file" >/dev/null
+    if python3 - "$file" <<'PYEOF'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB')
+px = im.getpixel((im.size[0] // 2, im.size[1] // 2))
+sys.exit(0 if px != (255, 255, 255) else 1)
+PYEOF
+    then return 0; fi
+    agent-browser wait 900 >/dev/null
+  done
+  return 0
+}
+
+run_case() {  # name w h page_file
+  local name="$1" w="$2" h="$3" url="file://$4"
   agent-browser set viewport "$w" "$h" >/dev/null
   agent-browser open "$url" >/dev/null
-  agent-browser wait 1500 >/dev/null
-  agent-browser screenshot "$OUT/$name.png" >/dev/null
+  agent-browser wait --fn "window.__drawn===true" --timeout 8000 >/dev/null \
+    || agent-browser wait 1500 >/dev/null
+  shot_stable "$url" "$OUT/$name.png"
   echo "== $name (${w}x${h})"
   if [[ "$url" == *trap* ]]; then
     "$ROOT/build/pool-trainer" analyze "$OUT/$name.png" --out "$OUT/$name" 2>&1 \
@@ -60,10 +78,11 @@ PYEOF
   fi
 }
 
-run_case size_1371x770 1371 770 "http://localhost:8791/index.html"
-run_case size_1920x1080 1920 1080 "http://localhost:8791/index.html"
-run_case size_1280x720 1280 720  "http://localhost:8791/index.html"
-run_case size_1024x576 1024 576  "http://localhost:8791/index.html"
-run_case trap_browser   1920 1080 "http://localhost:8791/trap.html"
+SITE="$HERE/live_site/index.html"
+run_case size_1371x770 1371 770  "$SITE"
+run_case size_1920x1080 1920 1080 "$SITE"
+run_case size_1280x720 1280 720  "$SITE"
+run_case size_1024x576 1024 576  "$SITE"
+run_case trap_browser   1920 1080 "$HERE/live_site/trap.html"
 agent-browser close >/dev/null 2>&1 || true
 echo "done -> $OUT"

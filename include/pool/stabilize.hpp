@@ -70,7 +70,11 @@ struct TrackedBall {
 
 class BallStabilizer {
 public:
-    BallStabilizer(int holdFrames = 5, double alpha = 0.5,
+    // holdFrames default 2: holds only bridge a single missed frame. A
+    // longer hold made guides draw on STALE positions after a shot — the
+    // struck ball became an unmatched fresh detection while the old track
+    // lingered, so arrows pointed from where the ball USED to be.
+    BallStabilizer(int holdFrames = 2, double alpha = 0.5,
                    double matchFactor = 1.5)
         : holdFrames_(holdFrames), alpha_(alpha), matchFactor_(matchFactor) {}
 
@@ -79,10 +83,20 @@ public:
         nextId_ = 1;
     }
 
+    // True when the last apply() saw the scene churn (several balls moved
+    // or appeared at once — a shot was struck). Guides should not be held
+    // over such frames.
+    bool churned() const { return churned_; }
+
     void apply(std::vector<Detection>& balls, double ballR) {
         const double matchR = matchFactor_ * std::max(1.0, ballR);
+        // A matched ball that jumped further than this did not jitter —
+        // it MOVED (was struck, or the player re-aimed). Gliding it would
+        // lag the guides behind the ball; snap instead.
+        const double snapR = 0.8 * std::max(1.0, ballR);
         std::vector<int> assigned(balls.size(), -1);
         std::vector<char> used(tracks_.size(), 0);
+        std::vector<double> dist(balls.size(), 0.0);
         for (size_t i = 0; i < balls.size(); ++i) {
             int best = -1;
             double bd = 1e18;
@@ -95,11 +109,29 @@ public:
                     best = static_cast<int>(t);
                 }
             }
+            dist[i] = bd;
             if (best >= 0 && bd <= matchR) {
                 assigned[i] = best;
                 used[best] = 1;
             }
         }
+        // Scene-churn census: two or more balls unmatched or jumped means
+        // a shot scattered the pack. Restart tracking from the fresh
+        // positions — nothing stale survives this frame.
+        int unmatched = 0, jumped = 0;
+        for (size_t i = 0; i < balls.size(); ++i) {
+            if (assigned[i] < 0) ++unmatched;
+            else if (dist[i] > snapR) ++jumped;
+        }
+        if (unmatched >= 2 || jumped >= 2 ||
+            balls.size() > tracks_.size() + 1) {
+            churned_ = true;
+            tracks_.clear();
+            for (const auto& d : balls)
+                tracks_.push_back(TrackedBall{d, 0, nextId_++});
+            return;  // fresh detections pass through unchanged
+        }
+        churned_ = false;
         std::vector<Detection> out;
         std::vector<TrackedBall> nt;
         out.reserve(balls.size() + tracks_.size());
@@ -108,12 +140,16 @@ public:
             Detection d = balls[i];
             if (assigned[i] >= 0) {
                 const TrackedBall& tr = tracks_[static_cast<size_t>(assigned[i])];
-                d.px.x = tr.d.px.x + (d.px.x - tr.d.px.x) * alpha_;
-                d.px.y = tr.d.px.y + (d.px.y - tr.d.px.y) * alpha_;
-                d.logical.x =
-                    tr.d.logical.x + (d.logical.x - tr.d.logical.x) * alpha_;
-                d.logical.y =
-                    tr.d.logical.y + (d.logical.y - tr.d.logical.y) * alpha_;
+                if (dist[i] > snapR) {
+                    // This ball moved for real: snap, keep its identity.
+                } else {
+                    d.px.x = tr.d.px.x + (d.px.x - tr.d.px.x) * alpha_;
+                    d.px.y = tr.d.px.y + (d.px.y - tr.d.px.y) * alpha_;
+                    d.logical.x =
+                        tr.d.logical.x + (d.logical.x - tr.d.logical.x) * alpha_;
+                    d.logical.y =
+                        tr.d.logical.y + (d.logical.y - tr.d.logical.y) * alpha_;
+                }
                 // Kind flapping (unknown <-> known): prefer the known kind.
                 if (d.kind == "unknown" && tr.d.kind != "unknown") {
                     d.kind = tr.d.kind;
@@ -157,6 +193,7 @@ private:
     double alpha_;
     double matchFactor_;
     long nextId_ = 1;
+    bool churned_ = false;
     std::vector<TrackedBall> tracks_;
 };
 
