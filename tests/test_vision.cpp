@@ -357,6 +357,161 @@ int main() {
         CHECK(maroon >= 1);
     }
 
+
+    // 7. Touching-ball cluster that PASSES the area window (two glued
+    //    balls = 2x a ball disc, inside areaHiFactor 2.4) used to be kept
+    //    as ONE misdetection at the midpoint. The splitter must resolve
+    //    it into two balls at the true centers.
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        double ax = 200 + 380 * sx, ay = 120 + 200 * sy;
+        double bx = ax + 26, by = ay;  // touching: centers 2R apart
+        disc(px, W, ax, ay, 13, 235, 200, 40);   // yellow 1
+        disc(px, W, bx, by, 13, 235, 200, 40);   // yellow 1
+        disc(px, W, 200 + 120 * sx, 120 + 300 * sy, 13, 250, 250, 250);
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        bool cue = false;
+        int clusterHits = 0;
+        for (const auto& d : det.balls) {
+            if (d.kind == "cue") cue = true;
+            if (std::hypot(d.px.x - ax, d.px.y - ay) < 7.0 ||
+                std::hypot(d.px.x - bx, d.px.y - by) < 7.0)
+                ++clusterHits;
+        }
+        CHECK(cue);
+        CHECK(clusterHits == 2);
+    }
+
+    // 8. A 3-ball triangle cluster (rejected by the area window) splits
+    //    into three balls; a cue elsewhere stays intact.
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        double ax = 200 + 400 * sx, ay = 120 + 180 * sy;
+        double bx = ax + 26, by = ay;
+        double cx = ax + 13, cy = ay + 22;  // ~triangle side 26
+        disc(px, W, ax, ay, 13, 40, 90, 220);     // blue 2
+        disc(px, W, bx, by, 13, 214, 60, 55);     // red 3
+        disc(px, W, cx, cy, 13, 235, 200, 40);    // yellow 1
+        disc(px, W, 200 + 130 * sx, 120 + 320 * sy, 13, 250, 250, 250);
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        int triHits = 0;
+        bool cue = false;
+        for (const auto& d : det.balls) {
+            if (d.kind == "cue") cue = true;
+            if (std::hypot(d.px.x - ax, d.px.y - ay) < 8.0 ||
+                std::hypot(d.px.x - bx, d.px.y - by) < 8.0 ||
+                std::hypot(d.px.x - cx, d.px.y - cy) < 8.0)
+                ++triHits;
+        }
+        CHECK(cue);
+        CHECK(triHits == 3);
+    }
+
+    // 9. A 2x2 cluster of four touching balls resolves to four balls.
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        double ax = 200 + 380 * sx, ay = 120 + 180 * sy;
+        double pts[4][2] = {{ax, ay}, {ax + 26, ay},
+                            {ax, ay + 26}, {ax + 26, ay + 26}};
+        for (int k = 0; k < 4; ++k)
+            disc(px, W, pts[k][0], pts[k][1], 13, 235, 200, 40);
+        disc(px, W, 200 + 120 * sx, 120 + 320 * sy, 13, 250, 250, 250);
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        int hits = 0;
+        bool cue = false;
+        for (const auto& d : det.balls) {
+            if (d.kind == "cue") cue = true;
+            for (int k = 0; k < 4; ++k)
+                if (std::hypot(d.px.x - pts[k][0], d.px.y - pts[k][1]) < 8.0)
+                    ++hits;
+        }
+        CHECK(cue);
+        CHECK(hits == 4);
+    }
+
+    // 10. A big UI plate (> 12x a ball area) must yield at least TWO
+    //     ball-sized discs to count as a cluster — a single disc means a
+    //     name plate / icon, not balls. It must NOT become a detection.
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        double plateX = 200 + 400 * sx, plateY = 120 + 200 * sy;
+        for (int y = -45; y <= 45; ++y)
+            for (int x = -45; x <= 45; ++x)
+                put(px, W, static_cast<int>(plateX) + x,
+                    static_cast<int>(plateY) + y, 214, 60, 55);
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        bool plateBall = false;
+        for (const auto& d : det.balls)
+            if (std::hypot(d.px.x - plateX, d.px.y - plateY) < 40.0)
+                plateBall = true;
+        CHECK(!plateBall);
+    }
+
+    // 11. A ball with a soft shadow hugging it must NOT split into two:
+    //     the shadow is part of the same blob and its visible crescent is
+    //     too close/thin to host a second full-size ball disc.
+    {
+        const int W = 1000, H = 640;
+        std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3, 0);
+        for (size_t i = 0; i < px.size(); i += 3) {
+            px[i] = 30; px[i + 1] = 32; px[i + 2] = 38;
+        }
+        for (int y = 120; y < 520; ++y)
+            for (int x = 200; x < 900; ++x)
+                put(px, W, x, y, 55, 165, 95);
+        TableSpec tbl = TableSpec::standard();
+        double sx = 700.0 / tbl.w, sy = 400.0 / tbl.h;
+        double bx = 200 + 300 * sx, by = 120 + 200 * sy;
+        disc(px, W, bx, by + 10, 13, 120, 40, 30);   // dark shadow under
+        disc(px, W, bx, by, 13, 235, 200, 40);       // yellow on top
+        Image img = makeImage(W, H, px);
+        DetectResult det = detectBalls(img, {}, tbl);
+        int near = 0;
+        for (const auto& d : det.balls)
+            if (std::hypot(d.px.x - bx, d.px.y - by) < 20.0) ++near;
+        CHECK(near == 1);
+    }
+
     if (gFail == 0) {
         std::printf("ALL VISION TESTS PASSED\n");
         return 0;

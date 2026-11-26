@@ -353,6 +353,11 @@ double inscribedDisc(const std::vector<uint8_t>& m, int w, int h, const Rect& bo
                 d = std::min(d, at(x + 1, y + 1) + 4.0f);
             if (x - 1 >= x0 && y + 1 <= y1)
                 d = std::min(d, at(x - 1, y + 1) + 4.0f);
+            // Write the backward result back: without this the right/down
+            // boundary never propagates and every disc center drifts
+            // toward the bottom-right of its ball by up to ~0.7R (the
+            // depth ends up measured against the left/top boundary only).
+            at(x, y) = d;
             float r = d / 3.0f;
             if (r > best && r <= cap) {
                 best = r;
@@ -953,6 +958,160 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
     struct Raw { Blob b; };
     std::vector<Raw> kept;
     int salvaged = 0;
+
+    // Inscribed-disc probes shared by the cluster splitter and the merged-
+    // blob salvage path: find a ball-sized disc inside a (possibly merged)
+    // blob, gate it against felt fragments and gray UI junk, keep only
+    // discs distinct from the parts already found, and erase the accepted
+    // disc from `mask` so the next probe moves on. The geometric gate
+    // (>= 1.35R from every accepted part) blocks shadow/line remnants that
+    // hug a real ball; touching balls sit ~2R apart and pass. Returns the
+    // number of accepted discs appended to `parts`.
+    auto probeDiscs = [&](std::vector<uint8_t>& mask, const Blob& src,
+                          int maxProbes, std::vector<Blob>& parts) -> int {
+        Rect grown{src.bbox.x0 - ballR - 2, src.bbox.y0 - ballR - 2,
+                   src.bbox.x1 + ballR + 2, src.bbox.y1 + ballR + 2};
+        int accepted = 0;
+        for (int probe = 0; probe < maxProbes; ++probe) {
+            Vec2 sc{};
+            double sr = inscribedDisc(mask, w, h, grown, ballR, sc);
+            if (sr < 0.72 * ballR) break;
+            bool good = true;
+            {
+                long felt = 0, tot = 0;
+                double sumS = 0, sumV = 0;
+                int ir = static_cast<int>(std::max(1.0, sr * 0.8));
+                for (int yy = static_cast<int>(sc.y) - ir;
+                     yy <= static_cast<int>(sc.y) + ir; ++yy) {
+                    for (int xx = static_cast<int>(sc.x) - ir;
+                         xx <= static_cast<int>(sc.x) + ir; ++xx) {
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        double dx = xx - sc.x, dy = yy - sc.y;
+                        if (dx * dx + dy * dy > ir * ir) continue;
+                        ++tot;
+                        Hsv cc = rgbToHsv(img.px[(static_cast<size_t>(yy) * w + xx) * 3],
+                                          img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
+                                          img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]);
+                        sumS += cc.s;
+                        sumV += cc.v;
+                        double hd = std::fabs(cc.h - feltHue.h);
+                        hd = std::min(hd, 360.0 - hd);
+                        if (std::fabs(cc.s - feltHue.s) < 0.32 &&
+                            std::fabs(cc.v - feltHue.v) < 0.32 &&
+                            (hd < 20.0 || cc.s < 0.12)) ++felt;
+                    }
+                }
+                if (tot > 0 && felt > tot * 0.6) good = false;  // felt fragment
+                // Gray/dim discs are UI junk, not balls (balls are
+                // white, colored or black).
+                if (tot > 0 && sumS / tot < 0.12 && sumV / tot < 0.72)
+                    good = false;
+            }
+            if (!good) {
+                // Erase the rejected disc so the next probe can move on.
+                int er = static_cast<int>(sr) + 1;
+                for (int yy = static_cast<int>(sc.y) - er;
+                     yy <= static_cast<int>(sc.y) + er; ++yy)
+                    for (int xx = static_cast<int>(sc.x) - er;
+                         xx <= static_cast<int>(sc.x) + er; ++xx) {
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        double dx = xx - sc.x, dy = yy - sc.y;
+                        if (dx * dx + dy * dy <= er * er)
+                            mask[static_cast<size_t>(yy) * w + xx] = 0;
+                    }
+                continue;
+            }
+            // Geometric gate: touching balls sit ~2R apart, so anything
+            // closer than 1.35R to an accepted part is its shadow, an aim-
+            // line remnant or a sub-radius fragment, never another ball.
+            for (const auto& pv : parts)
+                if (std::hypot(pv.cx - sc.x, pv.cy - sc.y) < 1.35 * ballR) {
+                    good = false;
+                    break;
+                }
+            if (!good) {
+                int er = static_cast<int>(sr) + 1;
+                for (int yy = static_cast<int>(sc.y) - er;
+                     yy <= static_cast<int>(sc.y) + er; ++yy)
+                    for (int xx = static_cast<int>(sc.x) - er;
+                         xx <= static_cast<int>(sc.x) + er; ++xx) {
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        double dx = xx - sc.x, dy = yy - sc.y;
+                        if (dx * dx + dy * dy <= er * er)
+                            mask[static_cast<size_t>(yy) * w + xx] = 0;
+                    }
+                continue;
+            }
+            // Accept a further probe only if it is a DIFFERENT ball:
+            // far enough from the earlier parts of this blob (touching
+            // balls sit ~2 radii apart) or clearly colored. Elongated white
+            // structures (the dilated cue-fallback mask) otherwise
+            // yield chains of overlapping "balls" 10 px apart.
+            double meanSat = 0;
+            long satN = 0;
+            {
+                int sir = static_cast<int>(std::max(1.0, sr));
+                for (int yy = static_cast<int>(sc.y) - sir;
+                     yy <= static_cast<int>(sc.y) + sir; ++yy)
+                    for (int xx = static_cast<int>(sc.x) - sir;
+                         xx <= static_cast<int>(sc.x) + sir; ++xx) {
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        double ddx = xx - sc.x, ddy = yy - sc.y;
+                        if (ddx * ddx + ddy * ddy > sir * sir) continue;
+                        meanSat += rgbToHsv(
+                            img.px[(static_cast<size_t>(yy) * w + xx) * 3],
+                            img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
+                            img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]).s;
+                        ++satN;
+                    }
+            }
+            meanSat = satN > 0 ? meanSat / satN : 0.0;
+            bool distinct = true;
+            for (const auto& pv : parts)
+                if (std::hypot(pv.cx - sc.x, pv.cy - sc.y) <
+                        2.0 * ballR &&
+                    meanSat < 0.15) {
+                    distinct = false;
+                    break;
+                }
+            if (!distinct) {
+                int er = static_cast<int>(sr) + 1;
+                for (int yy = static_cast<int>(sc.y) - er;
+                     yy <= static_cast<int>(sc.y) + er; ++yy)
+                    for (int xx = static_cast<int>(sc.x) - er;
+                         xx <= static_cast<int>(sc.x) + er; ++xx) {
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        double ddx = xx - sc.x, ddy = yy - sc.y;
+                        if (ddx * ddx + ddy * ddy <= er * er)
+                            mask[static_cast<size_t>(yy) * w + xx] = 0;
+                    }
+                continue;
+            }
+            ++salvaged;
+            ++accepted;
+            Blob cc = src;
+            cc.cx = sc.x;
+            cc.cy = sc.y;
+            cc.area = static_cast<long>(3.14159265358979323846 * sr * sr);
+            cc.bbox = Rect{sc.x - sr, sc.y - sr, sc.x + sr, sc.y + sr};
+            parts.push_back(cc);
+            // Erase a FULL ball radius: a smaller eraser re-finds a
+            // second disc inside the same ball (two detections 13px
+            // apart), which then poisons the cue isolation vote.
+            int er = static_cast<int>(sr) + 1;
+            for (int yy = static_cast<int>(sc.y) - er;
+                 yy <= static_cast<int>(sc.y) + er; ++yy)
+                for (int xx = static_cast<int>(sc.x) - er;
+                     xx <= static_cast<int>(sc.x) + er; ++xx) {
+                    if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                    double dx = xx - sc.x, dy = yy - sc.y;
+                    if (dx * dx + dy * dy <= er * er)
+                        mask[static_cast<size_t>(yy) * w + xx] = 0;
+                }
+        }
+        return accepted;
+    };
+
     for (const auto& b : blobs) {
         Blob c = b;
         bool ok = c.area >= opt.areaMin;
@@ -999,133 +1158,55 @@ DetectResult detectBalls(const Image& img, const DetectOptions& opt,
         }
         std::vector<Blob> parts;
         if (ok) {
-            parts.push_back(c);
+            // Touching-ball clusters (post-break racks, balls glued
+            // together) can pass the area window as ONE blob: two glued
+            // balls cover 2x a ball disc, inside areaHiFactor (2.4), and
+            // then classify from blended colors with a center between two
+            // real balls. Any plausible blob meaningfully larger than one
+            // ball disc is probed for several full-size inscribed discs;
+            // two or more accepted discs split it into real balls, a
+            // single disc keeps the original blob unchanged. The probe
+            // runs on a COPY of the mask: its erasures must not leak into
+            // the cue-fallback pass below when the split does not stick.
+            double rBlobOk = std::sqrt(
+                static_cast<double>(c.area) / 3.14159265358979323846);
+            if (rBlobOk > 1.25 * ballR) {
+                std::vector<uint8_t> splitMask = ballish;
+                int maxProbes = std::max(
+                    3, std::min(10,
+                                static_cast<int>(c.area / refArea) + 2));
+                probeDiscs(splitMask, c, maxProbes, parts);
+                if (parts.size() < 2) parts.clear();
+                if (parts.empty()) parts.push_back(c);
+            } else {
+                parts.push_back(c);
+            }
         } else {
             // Merged structures — cue + stick, cue + aim line + ghost disc
             // + an object ball, touching clusters — still contain ball-
-            // sized inscribed discs. Salvage up to three of them; the
+            // sized inscribed discs. Probe count scales with the blob's
+            // ball multiples so a multi-ball rack splits fully; the
             // stick/line remainder is dropped. 8BP draws the cue stick
             // glued to the ball, so the merged blob routinely exceeds
-            // 5x a ball area; 12x still rejects page-scale junk.
-            if (c.area > refArea * 12.0) continue;
-            if (salvaged >= 12) continue;  // junk images explode otherwise
-            Rect grown{c.bbox.x0 - ballR - 2, c.bbox.y0 - ballR - 2,
-                       c.bbox.x1 + ballR + 2, c.bbox.y1 + ballR + 2};
-            for (int probe = 0; probe < 3; ++probe) {
-                Vec2 sc{};
-                double sr = inscribedDisc(ballish, w, h, grown, ballR, sc);
-                if (sr < 0.72 * ballR) break;
-                bool good = true;
-                {
-                    long felt = 0, tot = 0;
-                    double sumS = 0, sumV = 0;
-                    int ir = static_cast<int>(std::max(1.0, sr * 0.8));
-                    for (int yy = static_cast<int>(sc.y) - ir;
-                         yy <= static_cast<int>(sc.y) + ir; ++yy) {
-                        for (int xx = static_cast<int>(sc.x) - ir;
-                             xx <= static_cast<int>(sc.x) + ir; ++xx) {
-                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-                            double dx = xx - sc.x, dy = yy - sc.y;
-                            if (dx * dx + dy * dy > ir * ir) continue;
-                            ++tot;
-                            Hsv cc = rgbToHsv(img.px[(static_cast<size_t>(yy) * w + xx) * 3],
-                                              img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
-                                              img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]);
-                            sumS += cc.s;
-                            sumV += cc.v;
-                            double hd = std::fabs(cc.h - feltHue.h);
-                            hd = std::min(hd, 360.0 - hd);
-                            if (std::fabs(cc.s - feltHue.s) < 0.32 &&
-                                std::fabs(cc.v - feltHue.v) < 0.32 &&
-                                (hd < 20.0 || cc.s < 0.12)) ++felt;
-                        }
-                    }
-                    if (tot > 0 && felt > tot * 0.6) good = false;  // felt fragment
-                    // Gray/dim discs are UI junk, not balls (balls are
-                    // white, colored or black).
-                    if (tot > 0 && sumS / tot < 0.12 && sumV / tot < 0.72)
-                        good = false;
-                }
-                if (!good) {
-                    // Erase the rejected disc so the next probe can move on.
-                    int er = static_cast<int>(sr) + 1;
-                    for (int yy = static_cast<int>(sc.y) - er;
-                         yy <= static_cast<int>(sc.y) + er; ++yy)
-                        for (int xx = static_cast<int>(sc.x) - er;
-                             xx <= static_cast<int>(sc.x) + er; ++xx) {
-                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-                            double dx = xx - sc.x, dy = yy - sc.y;
-                            if (dx * dx + dy * dy <= er * er)
-                                ballish[static_cast<size_t>(yy) * w + xx] = 0;
-                        }
-                    continue;
-                }
-                // Accept a further probe only if it is a DIFFERENT ball:
-                // far enough from the earlier parts of this blob (touching
-                // balls sit ~2R apart) or clearly colored. Elongated white
-                // structures (the dilated cue-fallback mask) otherwise
-                // yield chains of overlapping "balls" 10 px apart.
-                double meanSat = 0;
-                long satN = 0;
-                {
-                    int sir = static_cast<int>(std::max(1.0, sr));
-                    for (int yy = static_cast<int>(sc.y) - sir;
-                         yy <= static_cast<int>(sc.y) + sir; ++yy)
-                        for (int xx = static_cast<int>(sc.x) - sir;
-                             xx <= static_cast<int>(sc.x) + sir; ++xx) {
-                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-                            double ddx = xx - sc.x, ddy = yy - sc.y;
-                            if (ddx * ddx + ddy * ddy > sir * sir) continue;
-                            meanSat += rgbToHsv(
-                                img.px[(static_cast<size_t>(yy) * w + xx) * 3],
-                                img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 1],
-                                img.px[(static_cast<size_t>(yy) * w + xx) * 3 + 2]).s;
-                            ++satN;
-                        }
-                }
-                meanSat = satN > 0 ? meanSat / satN : 0.0;
-                bool distinct = true;
-                for (const auto& pv : parts)
-                    if (std::hypot(pv.cx - sc.x, pv.cy - sc.y) <
-                            2.0 * ballR &&
-                        meanSat < 0.15) {
-                        distinct = false;
-                        break;
-                    }
-                if (!distinct) {
-                    int er = static_cast<int>(sr) + 1;
-                    for (int yy = static_cast<int>(sc.y) - er;
-                         yy <= static_cast<int>(sc.y) + er; ++yy)
-                        for (int xx = static_cast<int>(sc.x) - er;
-                             xx <= static_cast<int>(sc.x) + er; ++xx) {
-                            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-                            double ddx = xx - sc.x, ddy = yy - sc.y;
-                            if (ddx * ddx + ddy * ddy <= er * er)
-                                ballish[static_cast<size_t>(yy) * w + xx] = 0;
-                        }
-                    continue;
-                }
-                ++salvaged;
-                Blob cc = c;
-                cc.cx = sc.x;
-                cc.cy = sc.y;
-                cc.area = static_cast<long>(3.14159265358979323846 * sr * sr);
-                cc.bbox = Rect{sc.x - sr, sc.y - sr, sc.x + sr, sc.y + sr};
-                parts.push_back(cc);
-                // Erase a FULL ball radius: a smaller eraser re-finds a
-                // second disc inside the same ball (two detections 13px
-                // apart), which then poisons the cue isolation vote.
-                int er = static_cast<int>(sr) + 1;
-                for (int yy = static_cast<int>(sc.y) - er;
-                     yy <= static_cast<int>(sc.y) + er; ++yy)
-                    for (int xx = static_cast<int>(sc.x) - er;
-                         xx <= static_cast<int>(sc.x) + er; ++xx) {
-                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-                        double dx = xx - sc.x, dy = yy - sc.y;
-                        if (dx * dx + dy * dy <= er * er)
-                            ballish[static_cast<size_t>(yy) * w + xx] = 0;
-                    }
+            // 5x a ball area; 16x still rejects page-scale junk, and a
+            // blob that size must yield at least TWO balls or it is a UI
+            // plate, not a cluster.
+            if (c.area > refArea * 16.0) continue;
+            if (salvaged >= 32) continue;  // junk images explode otherwise
+            // A blob this large must look like a union of round balls to
+            // be trusted as a cluster: any union of discs fills at most
+            // ~0.79 of its bbox, while a filled rectangle / UI name plate
+            // reaches ~1.0 and can host several inscribed discs inside its
+            // ring band even after the center is erased.
+            if (c.area > refArea * 12.0) {
+                double bw2 = std::max(1.0, c.bbox.w());
+                double bh2 = std::max(1.0, c.bbox.h());
+                if (c.area / (bw2 * bh2) > 0.85) continue;
             }
+            int maxProbes = std::max(
+                3, std::min(12, static_cast<int>(c.area / refArea) + 2));
+            probeDiscs(ballish, c, maxProbes, parts);
+            if (c.area > refArea * 12.0 && parts.size() < 2) continue;
         }
         for (const auto& pb : parts) {
             const Blob& c = pb;
