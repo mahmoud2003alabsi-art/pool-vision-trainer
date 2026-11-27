@@ -1294,11 +1294,17 @@ int main() {
             GetCursorPos(&mp);
             if (g_ov) ScreenToClient(g_ov, &mp);
             float mx = static_cast<float>(mp.x), my = static_cast<float>(mp.y);
+            // The menu exists to tune the game overlay: never hover-capture
+            // or take clicks while a known game window exists and is NOT in
+            // front (otherwise the panel floats over Explorer/desktop).
+            bool menuBlocked =
+                (g_game != nullptr && GetForegroundWindow() != g_game);
             // Click-through everywhere except when the cursor hovers the
             // panel (sticky while dragging): the game keeps its input.
             bool sticky = g_menu.draggingPanel || g_menu.dragSlider;
             bool overPanel = false;
-            if (g_menu.open && !g_menuHidden && !g_tabs.empty()) {
+            if (!menuBlocked && g_menu.open && !g_menuHidden &&
+                !g_tabs.empty()) {
                 mui::Rect pr = mui::panelRect(
                     g_m, g_menu, g_tabs[static_cast<size_t>(g_menu.activeTab)]);
                 overPanel = pr.contains(mx - 4, my - 4) ||
@@ -1309,7 +1315,7 @@ int main() {
                             ? (ex & ~WS_EX_TRANSPARENT)
                             : (ex | WS_EX_TRANSPARENT);
             if (want != ex) SetWindowLongW(g_ov, GWL_EXSTYLE, want);
-            if (down && !prevDown && !g_menuHidden) {
+            if (down && !prevDown && !g_menuHidden && !menuBlocked) {
                 mui::HitResult hr = mui::hitTest(g_m, g_menu, g_tabs, mx, my);
                 if (mui::press(g_m, g_menu, g_tabs, mx, my) &&
                     hr.hit == mui::H_Ctrl && hr.ctrl >= 0 &&
@@ -1826,8 +1832,11 @@ int main() {
                 LOGF("[--] game window not found (looking for \"%s\")", wbuf);
             }
         }
-        // menu last so it draws above the guides
-        if (fdc && g_menu.open && !g_menuHidden) drawMenu(fdc);
+        // menu last so it draws above the guides — but never over unrelated
+        // windows: only when the game window is not known to be covered.
+        if (fdc && g_menu.open && !g_menuHidden &&
+            !(g_game != nullptr && GetForegroundWindow() != g_game))
+            drawMenu(fdc);
         if (fdc) presentFrame(orc);
         ++frame;
         Sleep(1000 / g_args.fps);
