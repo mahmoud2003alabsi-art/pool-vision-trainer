@@ -124,7 +124,7 @@ SimResult simulate(const TableSpec& t, const std::vector<Ball>& balls,
                 if (A > 1e-12) {
                     double B = dRel.dot(d);
                     double disc = B * B - A * (dist * dist - D * D);
-                    if (disc > 0) u = clampd((B + std::sqrt(disc)) / A, 0.0, 1.0);
+                    if (disc > 0) u = clampd((std::sqrt(disc) - B) / A, 0.0, 1.0);
                 }
                 st[i].p = st[i].p - st[i].v * (p.dt * u);
                 st[j].p = st[j].p - st[j].v * (p.dt * u);
@@ -140,8 +140,12 @@ SimResult simulate(const TableSpec& t, const std::vector<Ball>& balls,
                 if (vrel <= 0) continue;  // already separating
 
                 // The spin kick follows the CUE's own pre-impact direction.
+                // Identify the cue BY INDEX (located at the top of simulate),
+                // not by id == 0: a caller may legitimately give the cue ball
+                // a non-zero id, and then the follow/draw kick and the
+                // first-contact bookkeeping silently vanished.
                 Vec2 cuePre;
-                bool cueIsI = st[i].id == 0, cueIsJ = st[j].id == 0;
+                bool cueIsI = i == cueIdx, cueIsJ = j == cueIdx;
                 if (cueIsI) cuePre = st[i].v.len() > 1e-9 ? st[i].v.norm() : Vec2{};
                 if (cueIsJ) cuePre = st[j].v.len() > 1e-9 ? st[j].v.norm() : Vec2{};
 
@@ -203,7 +207,7 @@ SimResult simulate(const TableSpec& t, const std::vector<Ball>& balls,
                     st[i].active = false;
                     st[i].v = Vec2{};
                     res.potted.push_back(st[i].id);
-                    if (st[i].id == 0) res.cueScratch = true;
+                    if (i == cueIdx) res.cueScratch = true;
                     res.events.push_back({time, "pot", st[i].id,
                                           static_cast<int>(k), st[i].p});
                     break;
@@ -241,13 +245,21 @@ SimResult simulate(const TableSpec& t, const std::vector<Ball>& balls,
 double minPotPower(const TableSpec& t, const std::vector<Ball>& balls,
                    const Vec2& cueDir, double spinF, double spinS,
                    int targetId, const PhysicsParams& p) {
+    // Locate the cue ball with the same convention as simulate (id 0
+    // preferred, else kind "cue") so a non-zero-id cue is not mistaken for
+    // a successful pot.
+    int cueId = 0;
+    for (size_t i = 0; i < balls.size(); ++i) {
+        if (balls[i].id == 0) { cueId = 0; break; }
+        if (balls[i].kind == "cue") { cueId = balls[i].id; break; }
+    }
     Vec2 dir = cueDir.len() > 1e-12 ? cueDir.norm() : Vec2{1, 0};
     for (double power = 0.10; power <= 1.001; power += 0.05) {
         Vec2 vel = dir * (p.maxShotSpeed * power);
         SimResult r = simulate(t, balls, vel, spinF, spinS, p);
         bool ok = false;
         for (int id : r.potted) {
-            if (id == 0) continue;  // a scratch does not count as success
+            if (id == cueId) continue;  // a scratch does not count as success
             if (targetId >= 0 && id != targetId) continue;
             ok = true;
             break;

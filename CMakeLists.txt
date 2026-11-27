@@ -17,6 +17,7 @@ add_library(poolcore
   src/geom.cpp
   src/solver.cpp
   src/physics.cpp
+  src/accuracy.cpp
 )
 target_include_directories(poolcore PUBLIC include)
 
@@ -39,6 +40,9 @@ target_link_libraries(pool_tests PRIVATE poolcore)
 
 add_executable(pool_tests_physics tests/test_physics.cpp)
 target_link_libraries(pool_tests_physics PRIVATE poolcore)
+
+add_executable(pool_tests_accuracy tests/test_accuracy.cpp)
+target_link_libraries(pool_tests_accuracy PRIVATE poolcore)
 
 # Windows-only live aim overlay (Win32 + GDI; reuses poolvision).
 if(WIN32)
@@ -67,6 +71,7 @@ endif()
 enable_testing()
 add_test(NAME solver_tests COMMAND pool_tests)
 add_test(NAME physics_tests COMMAND pool_tests_physics)
+add_test(NAME accuracy_tests COMMAND pool_tests_accuracy)
 
 add_executable(pool_tests_menu tests/test_menu.cpp)
 target_include_directories(pool_tests_menu PRIVATE overlay)

@@ -155,6 +155,33 @@ int main() {
                       fb.pos.y <= 438.1);
     }
 
+    // 11. Cue ball with a NON-ZERO id: the spin kick, first contact and
+    //     scratch detection must still work (cue identified by index, not
+    //     by id == 0).
+    {
+        Ball cue;
+        cue.id = 16;  // real 8-ball games: cue has a non-zero id
+        cue.kind = "cue";
+        cue.color = "white";
+        cue.pos = {450, 300};
+        cue.r = 12;
+        Ball obj;
+        obj.id = 3;
+        obj.kind = "solid";
+        obj.color = "red";
+        obj.pos = {450, 380};  // bottom-center pocket at (450, 450)
+        obj.r = 12;
+        std::vector<Ball> b = {cue, obj};
+        SimResult follow = simulate(tbl(), b, Vec2{0, 420}, 0.8, 0);
+        CHECK(follow.cueScratch);            // follow rolls into the pocket
+        CHECK(follow.firstContact == 3);     // first contact still tracked
+        SimResult draw = simulate(tbl(), b, Vec2{0, 420}, -0.8, 0);
+        CHECK(!draw.cueScratch);             // draw pulls the cue away
+        // minPotPower must not count the non-zero-id cue as a successful pot.
+        double pw = minPotPower(tbl(), b, Vec2{0, 1}, 0, 0, 3);
+        CHECK(pw > 0.0 && pw <= 1.0);
+    }
+
     std::printf("ALL PHYSICS TESTS PASSED (%d checks)\n", g_checks);
     return 0;
 }
