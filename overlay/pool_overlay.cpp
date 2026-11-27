@@ -21,6 +21,7 @@
 #include "pool/solver.hpp"
 #include "pool/stabilize.hpp"
 #include "pool/physics.hpp"
+#include "pool/advice.hpp"
 #include <algorithm>
 #include <map>
 #include <cmath>
@@ -1621,10 +1622,23 @@ int main() {
                         }
                     }
                     std::vector<pool::Shot> shots;
+                    pool::ShotAdvice recipe;
+                    bool haveRecipe = false;
                     if (!drewSim && cueIdx >= 0 && balls.size() >= 2) {
                         pool::Solver solver(det.table, balls, cueIdx,
                                             pool::SolverOptions{g_args.rails, 80.0, 0.98});
                         shots = solver.allShots();
+                        // Hacker recipe: the best EXECUTABLE shot — power,
+                        // cue contact point, predicted outcome and the
+                        // Monte-Carlo success probability.
+                        if (!shots.empty()) {
+                            auto adv = pool::adviseShots(
+                                det.table, balls, shots, cueIdx, 1);
+                            if (!adv.empty()) {
+                                recipe = adv[0];
+                                haveRecipe = true;
+                            }
+                        }
                     }
                     if (stick.found && cueIdx >= 0) g_guideHold = 3;
                     else if (g_guideHold > 0) --g_guideHold;
@@ -1634,6 +1648,29 @@ int main() {
                         drawGuides(det, shots, g_args.shots, fdc);
                     else if (!stick.found && g_ballStab.churned())
                         g_guideHold = 0;
+                    // Recipe contact dot: WHERE to strike the cue ball.
+                    // Side english shifts the dot along the aim
+                    // perpendicular; follow/draw shifts it behind/ahead.
+                    if (haveRecipe && recipe.shotIdx >= 0 &&
+                        recipe.shotIdx < static_cast<int>(shots.size()) &&
+                        cueIdx >= 0) {
+                        const pool::Shot& rs = shots[recipe.shotIdx];
+                        pool::Vec2 d = rs.ghost - det.balls[cueIdx].px;
+                        d = d.len() > 1e-9 ? d.norm() : pool::Vec2{1, 0};
+                        pool::Vec2 rt{-d.y, d.x};
+                        pool::Vec2 cpx =
+                            det.balls[cueIdx].px +
+                            rt * (recipe.spinS * det.ballRPx) -
+                            d * (recipe.spinF * det.ballRPx);
+                        double rr = det.ballRPx * 0.35;
+                        HBRUSH dot = CreateSolidBrush(RGB(255, 60, 60));
+                        RECT rc{static_cast<LONG>(cpx.x - rr),
+                                static_cast<LONG>(cpx.y - rr),
+                                static_cast<LONG>(cpx.x + rr),
+                                static_cast<LONG>(cpx.y + rr)};
+                        FillRect(fdc, &rc, dot);
+                        DeleteObject(dot);
+                    }
                     if (g_visible && analyzed && cueIdx >= 0) {
                         // The table boundary, drawn so the player can SEE
                         // the locked field. While locked, det.feltRect IS
@@ -1722,8 +1759,8 @@ int main() {
                                                180.0 / 3.14159265358979323846);
                         else
                             _snwprintf(aimTxt, 16, L"aim=--");
-                        wchar_t buf[200];
-                        _snwprintf(buf, 200,
+                        wchar_t buf[260];
+                        _snwprintf(buf, 260,
                                    L"balls=%d shots=%d sim=%s pot=%d%s "
                                    L"| %s %s | R=%.1f tolV=%.2f%s",
                                    static_cast<int>(balls.size()),
@@ -1735,6 +1772,18 @@ int main() {
                                    g_args.ballR > 1 ? g_args.ballR : det.ballRPx,
                                    g_args.feltTolV,
                                    g_args.manualRect ? L" [MAN]" : L"");
+                        if (haveRecipe && recipe.objId >= 0) {
+                            wchar_t rbuf[110];
+                            _snwprintf(rbuf, 110,
+                                       L" | RECIPE b=%d pwr=%.0f%%%hs "
+                                       L"PS=%.0f%%%s",
+                                       recipe.objId, recipe.power * 100.0,
+                                       recipe.spinLabel.c_str(),
+                                       recipe.pSuccess * 100.0,
+                                       recipe.scratch ? L" SCRATCH!" : L"");
+                            wcsncat(buf, rbuf,
+                                    260 - wcslen(buf) - 1);
+                        }
                         g_status = buf;
                     }
                     if (!g_menu.open && !g_menuHidden) drawHud(fdc, orc);

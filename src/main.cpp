@@ -7,7 +7,9 @@
 //
 //   pool-trainer analyze <image> [--out DIR] [--table WxH] [--max-rails N]
 //       Detect balls on any top-down table image, solve shots, write
-//       <image>_annotated.png / <image>_result.json.
+//       <image>_annotated.png / <image>_result.json. The top shots come
+//       with a full RECIPE: recommended power, cue contact point (spin),
+//       predicted ball destinations and the Monte-Carlo success probability.
 //
 //   pool-trainer simulate <image> [--out DIR] [--table WxH] [--power P]
 //       [--contact DX,DY] [--dir DEG] [--shot N] [--max-rails N]
@@ -25,6 +27,7 @@
 //       the live overlay to consume.
 //
 //   pool-trainer version
+#include "pool/advice.hpp"
 #include "pool/jsonw.hpp"
 #include "pool/physics.hpp"
 #include "pool/render.hpp"
@@ -33,6 +36,7 @@
 #include "pool/vision.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <cmath>
 #include <cstdio>
@@ -238,6 +242,10 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
     Solver solver(tbl, balls, cueIdx, SolverOptions{maxRails, 80.0, 0.98});
     std::vector<Shot> shots = solver.allShots();
 
+    // Full shot recipes for the best shots: recommended power, cue contact
+    // point, predicted destinations and Monte-Carlo success probability.
+    std::vector<ShotAdvice> advices = adviseShots(tbl, balls, shots, cueIdx, 3);
+
     std::cout << "\nshots found: " << shots.size() << " (top " << top << ")\n";
     for (int i = 0; i < static_cast<int>(shots.size()) && i < top; ++i) {
         const Shot& s = shots[i];
@@ -250,6 +258,20 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
         if (s.typeName == "kick") std::printf("  [hit object, no pocket]\n");
         else std::printf("\n");
     }
+
+    // ----- RECIPE block: what to hit, with what, and where balls go ---------
+    std::cout << "\nrecipes (best first):\n";
+    for (size_t i = 0; i < advices.size(); ++i) {
+        const ShotAdvice& a = advices[i];
+        std::printf("  R%zu ball=%-3s pocket=%d pwr=%3.0f%% %-14s pots=%s "
+                    "scratch=%s PS=%3.0f%% cueRest=(%.0f,%.0f)\n",
+                    i + 1, a.objId >= 0 ? std::to_string(a.objId).c_str() : "-",
+                    a.pocketIdx + 1, a.power * 100.0, a.spinLabel.c_str(),
+                    a.potsTarget ? "YES" : "no", a.scratch ? "YES!" : "no",
+                    a.pSuccess * 100.0, a.cueRest.x, a.cueRest.y);
+    }
+    if (advices.empty())
+        std::printf("  (no executable recipe found)\n");
 
     // ----- annotated image -------------------------------------------------
     // Rendered exactly like the live overlay: perspective quad mapping,
@@ -357,6 +379,67 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
                       static_cast<double>(s.cutDeg), s.confidence);
         drawTextCentered(ann, labelAt + Vec2{0.0, 8.0 + 12.0 * rank}, buf, col, 2);
     }
+
+    // ----- recipe overlay (best advice) --------------------------------------
+    // The hacker view: WHERE to strike the cue ball (contact dot), WHAT
+    // power and spin to use (HUD text), and WHERE every ball goes (sim
+    // paths + rest rings + pot flashes).
+    if (!advices.empty() && advices[0].potsTarget && advices[0].objId >= 0) {
+        const ShotAdvice& a = advices[0];
+        const Shot* src = a.shotIdx >= 0 &&
+                          a.shotIdx < static_cast<int>(shots.size())
+                              ? &shots[a.shotIdx] : nullptr;
+        Vec2 aimDir = src ? (src->ghost - balls[cueIdx].pos).norm()
+                          : Vec2{1, 0};
+        Vec2 right = aimDir.rot90();
+        Vec2 cuePx2 = toPx(balls[cueIdx].pos);
+        // Contact point on the cue ball: side english shifts the dot along
+        // the perpendicular, follow/draw shifts it along the aim line
+        // (top-down view of the cue tip position).
+        Vec2 contactPx =
+            cuePx2 + right * (a.spinS * ballPx) - aimDir * (a.spinF * ballPx);
+        Rgb dotCol = a.spinF < -0.25 ? Rgb{80, 180, 255}
+                     : a.spinF > 0.25 ? Rgb{255, 120, 120}
+                                      : Rgb{255, 210, 60};
+        drawCircle(ann, contactPx, ballPx * 0.3, dotCol, 2, true);
+        drawCircle(ann, cuePx2, ballPx + 3, dotCol, 1);
+
+        // Predicted paths from the actual recipe sim (cue = white dashed,
+        // object = its shot color solid), rest rings for every ball.
+        for (size_t i = 0; i < a.sim.paths.size(); ++i) {
+            bool isCue = static_cast<int>(i) == cueIdx;
+            bool isObj = src && static_cast<int>(i) == src->objectIdx;
+            if (!isCue && !isObj) continue;
+            const auto& path = a.sim.paths[i];
+            Rgb c = isCue ? Rgb{255, 255, 255} : shotColor(0);
+            for (size_t k = 0; k + 1 < path.size(); ++k)
+                drawLine(ann, toPx(path[k]), toPx(path[k + 1]), c, 1,
+                         isCue, 6);
+        }
+        for (const auto& fb : a.sim.final) {
+            if (!fb.active) continue;
+            drawCircle(ann, toPx(fb.pos), ballPx * 0.9, {200, 255, 200}, 1);
+        }
+        for (const auto& e : a.sim.events) {
+            if (e.kind != "pot" || e.other < 0 ||
+                e.other >= static_cast<int>(tbl.pockets.size()))
+                continue;
+            drawCircle(ann, toPx(tbl.pockets[e.other].pos), ballPx * 1.1,
+                       {255, 255, 0}, 2);
+        }
+        // HUD: the recipe in one line near the cue ball.
+        char hud[80];
+        std::snprintf(hud, sizeof(hud), "PWR %2.0f%% PS %2.0f%%",
+                      a.power * 100.0, a.pSuccess * 100.0);
+        std::string spinShort =
+            a.spinLabel.substr(0, a.spinLabel.find(' '));
+        for (auto& ch : spinShort) ch = static_cast<char>(std::toupper(ch));
+        std::string line = hud;
+        // append spin after the power, e.g. "PWR 45% DRAW PS 87%"
+        line.insert(line.find(" PS"), " " + spinShort);
+        drawTextCentered(ann, cuePx2 + Vec2{0, -ballPx - 12}, line.c_str(),
+                         dotCol, 2);
+    }
     std::string annPath = (fs::path(outDir) / (baseName + "_annotated.png")).string();
     if (!saveImage(annPath, ann)) {
         std::fprintf(stderr, "failed to save %s\n", annPath.c_str());
@@ -418,6 +501,27 @@ int runPipeline(const Image& img, const TableSpec& table, const std::string& out
             .kvRaw("cue_path", jsonVec2List(s.cuePath))
             .kvRaw("object_path", jsonVec2List(s.objPath))
             .kvRaw("tangent_dir", jsonVec2(s.tangentDir.x, s.tangentDir.y))
+        .endObj();
+    }
+    j.endArr();
+    // Shot recipes (best first): executable power + cue contact + outcome.
+    j.beginArr("recipes");
+    for (const auto& a : advices) {
+        j.beginObj()
+            .kvInt("shot_index", a.shotIdx)
+            .kvInt("ball", a.objId)
+            .kvInt("pocket", a.pocketIdx + 1)
+            .kv("type", a.typeName)
+            .kvNum("power", a.power, 2)
+            .kvNum("contact_x", a.spinS, 2)
+            .kvNum("contact_y", a.spinF, 2)
+            .kv("spin", a.spinLabel)
+            .kvBool("pots_ball", a.potsTarget)
+            .kvBool("cue_scratch", a.scratch)
+            .kvInt("potted_count", a.potted)
+            .kvNum("success_probability", a.pSuccess, 3)
+            .kvRaw("cue_rest", jsonVec2(a.cueRest.x, a.cueRest.y))
+            .kvRaw("ball_rest", jsonVec2(a.objRest.x, a.objRest.y))
         .endObj();
     }
     j.endArr();
@@ -504,6 +608,15 @@ int runSimulate(const Image& img, const TableSpec& tableIn,
         return 1;
     }
 
+    // The player's ACTUAL power, read off the frame: the 8BP power slider
+    // (most direct) or the cue stick pull distance. Fixes the evaluated
+    // error mode where the sim blasted full power while the player played
+    // soft.
+    pool::CueStick stick =
+        pool::findCueStick(img, det.balls[cueIdx].px, det.ballRPx,
+                           det.feltRect);
+    double powSlider = pool::findPowerSlider(img, det.feltRect, det.ballRPx);
+
     // Pixel <-> logical mapping (identical to the detection shrink).
     Rect f = det.feltRect;
     f.x0 += 2; f.y0 += 2; f.x1 -= 2; f.y1 -= 2;
@@ -549,15 +662,27 @@ int runSimulate(const Image& img, const TableSpec& tableIn,
     double spinF = clampd(a.contactY, -1.0, 1.0);  // +Y follow, -Y draw
     double spinS = clampd(a.contactX, -1.0, 1.0);  // X side english
 
-    // Power: user value or the minimum that pots.
+    // Power priority: explicit --power > the player's OWN pull detected in
+    // the frame (slider, then cue pull) > minimum that pots > full power.
     double power = a.power;
     bool autoPower = power < 0;
-    if (autoPower) {
+    std::string powerSource = autoPower ? "" : "manual";
+    if (autoPower && powSlider > 0.02) {
+        power = clampd(powSlider, 0.05, 1.0);
+        powerSource = "detected slider";
+    } else if (autoPower && stick.found && stick.power > 0.02) {
+        power = clampd(stick.power, 0.05, 1.0);
+        powerSource = "detected cue pull";
+    }
+    if (autoPower && powerSource.empty()) {
         power = minPotPower(tbl, balls, dirL, spinF, spinS, targetId);
         if (power < 0) {
             std::printf("no pot possible along this aim even at 100%% power "
                         "- showing the full-power outcome anyway\n");
             power = 1.0;
+            powerSource = "full-power fallback";
+        } else {
+            powerSource = "auto-min-pot";
         }
     }
     power = clampd(power, 0.05, 1.0);
@@ -573,8 +698,8 @@ int runSimulate(const Image& img, const TableSpec& tableIn,
     if (spinS > 0.25) contactLbl += " + right english";
     else if (spinS < -0.25) contactLbl += " + left english";
     std::printf("\n===== SIMULATION =====\n");
-    std::printf("aim: %.1f deg (%s) | power: %.2f%s | contact: (%.1f,%.1f) %s\n",
-                aimDeg, aimSource.c_str(), power, autoPower ? " (auto-min)" : "",
+    std::printf("aim: %.1f deg (%s) | power: %.2f (%s) | contact: (%.1f,%.1f) %s\n",
+                aimDeg, aimSource.c_str(), power, powerSource.c_str(),
                 spinS, spinF, contactLbl.c_str());
     if (sim.firstContact >= 0)
         std::printf("first contact: ball %d\n", sim.firstContact);
@@ -642,6 +767,7 @@ int runSimulate(const Image& img, const TableSpec& tableIn,
         .kv("kind", "simulation")
         .beginObj("aim")
             .kv("source", aimSource)
+            .kv("power_source", powerSource)
             .kvNum("deg", aimDeg, 1)
             .kvNum("power", power, 2)
             .kvNum("contact_x", spinS, 2)
